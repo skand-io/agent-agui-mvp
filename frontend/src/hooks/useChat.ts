@@ -69,9 +69,11 @@ export function useChatWithContext() {
     let buffer = '';
     let currentText = '';
     let currentMessageId: string | null = null;
+    let lastAssistantMessageId: string | null = null; // Persists after TEXT_MESSAGE_END
     const toolCalls: Record<string, ToolCall> = {};
     let updatedMessages = [...currentMessages];
     let frontendToolExecuted = false;
+    let backendToolExecuted = false;
     let toolAction: CopilotAction | undefined;
 
     while (true) {
@@ -95,10 +97,14 @@ export function useChatWithContext() {
               event,
               currentText,
               currentMessageId,
+              lastAssistantMessageId,
               toolCalls,
               actionsRef.current,
               (text) => { currentText = text; },
-              (id) => { currentMessageId = id; },
+              (id) => {
+                currentMessageId = id;
+                if (id) lastAssistantMessageId = id; // Track last assistant message
+              },
               (newMsgs) => {
                 updatedMessages = newMsgs;
                 setMessages(newMsgs);
@@ -110,6 +116,9 @@ export function useChatWithContext() {
               frontendToolExecuted = true;
               toolAction = result.action;
             }
+            if (result.backendToolExecuted) {
+              backendToolExecuted = true;
+            }
           } catch {
             // Ignore JSON parse errors for incomplete chunks
           }
@@ -117,8 +126,12 @@ export function useChatWithContext() {
       }
     }
 
-    // Auto follow-up after frontend tool execution
-    if (frontendToolExecuted && toolAction && !toolAction.disableFollowUp) {
+    // Auto follow-up after ANY tool execution (backend or frontend)
+    const shouldFollowUp =
+      (frontendToolExecuted && toolAction && !toolAction.disableFollowUp) ||
+      backendToolExecuted;
+
+    if (shouldFollowUp) {
       return sendMessageInternal(updatedMessages, depth + 1);
     }
 
@@ -197,13 +210,14 @@ async function handleEventWithContext(
   event: AGUIEvent,
   currentText: string,
   currentMessageId: string | null,
+  lastAssistantMessageId: string | null,
   toolCalls: Record<string, ToolCall>,
   actions: Map<string, CopilotAction>,
   setCurrentText: (text: string) => void,
   setCurrentMessageId: (id: string | null) => void,
   setMessages: (messages: Message[]) => void,
   currentMessages: Message[]
-): Promise<{ frontendToolExecuted: boolean; action?: CopilotAction; result?: string }> {
+): Promise<{ frontendToolExecuted: boolean; backendToolExecuted: boolean; action?: CopilotAction; result?: string }> {
   switch (event.type) {
     case EventType.RUN_STARTED:
       console.log('[AG-UI] Run started:', event.runId, 'input:', event.input);
@@ -273,25 +287,45 @@ async function handleEventWithContext(
       if (!event.toolCallId) break;
       const toolCall = toolCalls[event.toolCallId];
 
-      // For todo_write, attach to the last assistant message for UI rendering
+      // For todo_write, attach to the current assistant message for UI rendering
       if (toolCall.name === 'todo_write') {
         const updated = [...currentMessages];
-        // Find last assistant message index
-        let lastAssistantIdx = -1;
-        for (let i = updated.length - 1; i >= 0; i--) {
-          if (updated[i].role === 'assistant') {
-            lastAssistantIdx = i;
-            break;
+        // Find the assistant message by lastAssistantMessageId (from this run)
+        let targetIdx = -1;
+        if (lastAssistantMessageId) {
+          for (let i = updated.length - 1; i >= 0; i--) {
+            if (updated[i].role === 'assistant' && updated[i].id === lastAssistantMessageId) {
+              targetIdx = i;
+              break;
+            }
           }
         }
-        if (lastAssistantIdx >= 0) {
-          const msg = updated[lastAssistantIdx];
-          msg.toolCalls = msg.toolCalls || [];
-          msg.toolCalls.push({
-            id: event.toolCallId,
-            name: toolCall.name,
-            arguments: toolCall.arguments,
-          });
+        // If no matching ID, create a new assistant message for the todo
+        if (targetIdx < 0) {
+          const newMessage: Message = {
+            role: 'assistant',
+            content: '',
+            id: `todo-${event.toolCallId}`,
+            toolCalls: [{
+              id: event.toolCallId,
+              name: toolCall.name,
+              arguments: toolCall.arguments,
+            }],
+          };
+          setMessages([...updated, newMessage]);
+        } else {
+          // Immutably update the message with tool calls
+          updated[targetIdx] = {
+            ...updated[targetIdx],
+            toolCalls: [
+              ...(updated[targetIdx].toolCalls || []),
+              {
+                id: event.toolCallId,
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+              },
+            ],
+          };
           setMessages(updated);
         }
         // Don't return - let the backend handle the TOOL_CALL_RESULT
@@ -313,7 +347,7 @@ async function handleEventWithContext(
             toolCallId: event.toolCallId,
           };
           setMessages([...currentMessages, toolMessage]);
-          return { frontendToolExecuted: true, action: contextAction, result };
+          return { frontendToolExecuted: true, backendToolExecuted: false, action: contextAction, result };
         } catch (e) {
           const errorMsg = e instanceof Error ? e.message : 'Unknown error';
           console.error('Frontend tool error:', e);
@@ -352,19 +386,28 @@ async function handleEventWithContext(
       break;
     }
 
-    case EventType.TOOL_CALL_RESULT:
+    case EventType.TOOL_CALL_RESULT: {
       console.log('[AG-UI] Backend tool result:', event.content);
-      setMessages([
-        ...currentMessages,
-        {
+
+      // Look up the tool name from the toolCallId
+      const toolName = event.toolCallId ? toolCalls[event.toolCallId]?.name : null;
+
+      // todo_write is UI-only, don't trigger follow-up
+      const isTodoWrite = toolName === 'todo_write';
+
+      if (!isTodoWrite) {
+        const toolResultMessage: Message = {
           role: 'tool',
-          content: `Backend tool result: ${event.content}`,
+          content: event.content || '',
           isFrontend: false,
           isBackend: true,
           toolCallId: event.toolCallId,
-        },
-      ]);
-      break;
+        };
+        setMessages([...currentMessages, toolResultMessage]);
+      }
+
+      return { frontendToolExecuted: false, backendToolExecuted: !isTodoWrite };
+    }
 
     case EventType.RUN_FINISHED:
       console.log('[AG-UI] Run finished:', event.runId, 'result:', event.result);
@@ -425,5 +468,5 @@ async function handleEventWithContext(
       break;
   }
 
-  return { frontendToolExecuted: false };
+  return { frontendToolExecuted: false, backendToolExecuted: false };
 }
