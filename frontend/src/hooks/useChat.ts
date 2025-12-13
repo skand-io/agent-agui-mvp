@@ -284,6 +284,43 @@ function attachToolCallToAssistant(
   return updated;
 }
 
+// Helper function specifically for todo_write - updates existing todo list instead of creating new one
+// This ensures a single, evolving todo list throughout the conversation
+function attachOrUpdateTodoWrite(
+  messages: Message[],
+  toolCallId: string,
+  toolCallArguments: string,
+  lastAssistantMessageId: string | null
+): Message[] {
+  const updated = [...messages];
+
+  // First, look for existing todo_write in any message
+  for (let i = updated.length - 1; i >= 0; i--) {
+    const existingTodoCall = updated[i].toolCalls?.find(tc => tc.name === 'todo_write');
+    if (existingTodoCall) {
+      // Update the existing todo_write with new arguments (new todo list state)
+      updated[i] = {
+        ...updated[i],
+        toolCalls: updated[i].toolCalls!.map(tc =>
+          tc.name === 'todo_write'
+            ? { ...tc, id: toolCallId, arguments: toolCallArguments }
+            : tc
+        ),
+      };
+      return updated;
+    }
+  }
+
+  // No existing todo_write found, use normal attachment
+  return attachToolCallToAssistant(
+    messages,
+    toolCallId,
+    'todo_write',
+    toolCallArguments,
+    lastAssistantMessageId
+  );
+}
+
 // Handle event with context actions and return tool execution info
 async function handleEventWithContext(
   event: AGUIEvent,
@@ -366,13 +403,12 @@ async function handleEventWithContext(
       if (!event.toolCallId) break;
       const toolCall = toolCalls[event.toolCallId];
 
-      // For todo_write, attach to the assistant message for UI rendering
-      // Backend will handle the TOOL_CALL_RESULT
+      // For todo_write, update existing todo list or create new one
+      // This ensures a single, evolving todo list throughout the conversation
       if (toolCall.name === 'todo_write') {
-        const updatedWithToolCall = attachToolCallToAssistant(
+        const updatedWithToolCall = attachOrUpdateTodoWrite(
           currentMessages,
           event.toolCallId,
-          toolCall.name,
           toolCall.arguments,
           lastAssistantMessageId
         );
@@ -483,17 +519,28 @@ async function handleEventWithContext(
       const toolName = toolCall?.name || null;
       const isTodoWrite = toolName === 'todo_write';
 
-      // First, attach the toolCall to the assistant message (OpenAI API requirement)
-      // The helper function prevents duplicates if already attached in TOOL_CALL_END
+      // Attach the toolCall to the assistant message (OpenAI API requirement)
+      // For todo_write, use the special function that updates existing todo lists
       let updatedMessages = currentMessages;
       if (event.toolCallId && toolCall) {
-        updatedMessages = attachToolCallToAssistant(
-          currentMessages,
-          event.toolCallId,
-          toolCall.name,
-          toolCall.arguments,
-          lastAssistantMessageId
-        );
+        if (isTodoWrite) {
+          // Use special handler that updates existing todo list
+          updatedMessages = attachOrUpdateTodoWrite(
+            currentMessages,
+            event.toolCallId,
+            toolCall.arguments,
+            lastAssistantMessageId
+          );
+        } else {
+          // Regular tool attachment
+          updatedMessages = attachToolCallToAssistant(
+            currentMessages,
+            event.toolCallId,
+            toolCall.name,
+            toolCall.arguments,
+            lastAssistantMessageId
+          );
+        }
       }
 
       // For todo_write, add a message that instructs LLM to continue with tasks
