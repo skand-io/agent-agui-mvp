@@ -96,8 +96,52 @@ encoder = EventEncoder()
 # Backend tools - these execute on the server
 
 # TodoWrite tool prompt - follows PostHog's ee/hogai pattern
+def _todo_write_handler(todos: list) -> str:
+    """
+    Smart handler for todo_write that provides context-aware responses
+    to guide the LLM through the proper workflow.
+    """
+    if not todos:
+        return "Todo list cleared."
+
+    # Count statuses
+    completed = sum(1 for t in todos if t.get('status') == 'completed')
+    in_progress = sum(1 for t in todos if t.get('status') == 'in_progress')
+    pending = sum(1 for t in todos if t.get('status') == 'pending')
+    total = len(todos)
+
+    # All completed
+    if completed == total:
+        return f"All {total} tasks completed! Summarize the results for the user."
+
+    # Has in_progress task - execute it
+    if in_progress > 0:
+        in_progress_task = next(t for t in todos if t.get('status') == 'in_progress')
+        return f"Task '{in_progress_task.get('content', 'current task')}' is now in progress. Execute this task now, then call todo_write to mark it as completed."
+
+    # Has pending tasks but none in progress - start the next one
+    if pending > 0:
+        next_pending = next(t for t in todos if t.get('status') == 'pending')
+        return f"Todo list updated ({completed}/{total} completed). Now call todo_write to mark '{next_pending.get('content', 'next task')}' as in_progress, then execute it."
+
+    return f"Todo list updated ({completed}/{total} completed)."
+
+
 TODO_WRITE_PROMPT = """
 Use this tool to build and maintain a structured to-do list for the current session. It helps you monitor progress, organize complex work, and show thoroughness.
+
+# CRITICAL: Real-time Progress Updates
+
+You MUST call todo_write to update the todo list at these specific moments:
+1. **BEFORE starting a task**: Mark it as `in_progress`
+2. **AFTER completing a task**: Mark it as `completed`
+
+This creates a clear visual progress indicator for the user:
+- todo_write (mark task 1 in_progress) → execute tool → todo_write (mark task 1 completed)
+- todo_write (mark task 2 in_progress) → execute tool → todo_write (mark task 2 completed)
+- ... and so on for each task
+
+IMPORTANT: The user sees the todo list update in real-time. If you don't call todo_write after completing a task, the user won't see their progress!
 
 # When to use this tool
 Use it proactively in these situations:
@@ -108,7 +152,7 @@ Use it proactively in these situations:
 4. User supplies multiple tasks – e.g., a numbered or comma-separated list
 5. After new instructions arrive – immediately capture the requirements as to-dos
 6. When you begin a task – set it to `in_progress` BEFORE starting; ideally only one `in_progress` item at a time
-7. After finishing a task – mark it `completed` and add any follow-ups discovered during execution
+7. After finishing a task – mark it `completed` IMMEDIATELY and add any follow-ups discovered during execution
 
 # When NOT to use this tool
 Skip it when:
@@ -122,35 +166,42 @@ NOTE: If there's just one trivial task, don't use the tool–simply do the task 
 # Examples of when to use the todo list
 
 <example>
-User: Help me build a login page with form validation, error handling, and password reset
-Assistant: I'll help you build a login page. Let me create a todo list to track this.
-*Creates todo list:*
-1. Create login form component
-2. Add form validation logic
-3. Implement error handling and display
-4. Add password reset flow
+User: Get the weather for Tokyo and calculate 5+3
+Assistant: I'll help you with these tasks. Let me create a todo list.
+
+Step 1: Create todo list
+*Calls todo_write with:*
+- Task 1: Get weather for Tokyo (pending)
+- Task 2: Calculate 5+3 (pending)
+
+Step 2: Start first task
+*Calls todo_write with:*
+- Task 1: Get weather for Tokyo (in_progress)
+- Task 2: Calculate 5+3 (pending)
+
+Step 3: Execute first task
+*Calls get_weather("Tokyo")*
+
+Step 4: Complete first task
+*Calls todo_write with:*
+- Task 1: Get weather for Tokyo (completed)
+- Task 2: Calculate 5+3 (pending)
+
+Step 5: Start second task
+*Calls todo_write with:*
+- Task 1: Get weather for Tokyo (completed)
+- Task 2: Calculate 5+3 (in_progress)
+
+Step 6: Execute second task
+*Calls calculate("5+3")*
+
+Step 7: Complete second task
+*Calls todo_write with:*
+- Task 1: Get weather for Tokyo (completed)
+- Task 2: Calculate 5+3 (completed)
 
 <reasoning>
-The assistant used the todo list because:
-1. Building a login page involves multiple components and concerns
-2. The user explicitly mentioned several features (validation, error handling, reset)
-3. Each feature requires distinct implementation steps
-</reasoning>
-</example>
-
-<example>
-User: I need to implement user authentication, set up a database, and create API endpoints for my app
-Assistant: I'll help you implement these features. Let me create a todo list to track this work.
-*Creates todo list:*
-1. Set up database schema and connection
-2. Implement user authentication system
-3. Create API endpoints
-
-<reasoning>
-The assistant used the todo list because:
-1. The user provided multiple distinct features to implement
-2. Each feature is a complex task requiring multiple steps
-3. The todo list helps track progress across all features
+The assistant called todo_write BEFORE and AFTER each tool execution to show real-time progress.
 </reasoning>
 </example>
 
@@ -324,7 +375,7 @@ BACKEND_TOOLS = {
             },
             "required": ["todos"]
         },
-        "handler": lambda todos: "To-dos updated successfully. Continue with any active tasks."
+        "handler": lambda todos: _todo_write_handler(todos)
     }
 }
 

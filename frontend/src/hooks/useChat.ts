@@ -543,13 +543,11 @@ async function handleEventWithContext(
         }
       }
 
-      // For todo_write, add a message that instructs LLM to continue with tasks
-      // For other tools, add the actual result
+      // Add the tool result message - use actual backend response for all tools
+      // The backend's smart handler provides context-aware responses for todo_write
       const toolResultMessage: Message = {
         role: 'tool',
-        content: isTodoWrite
-          ? 'Todo list created. Now execute the tasks in the list one by one. Do NOT call todo_write again until you have completed at least one task.'
-          : (event.content || ''),
+        content: event.content || '',
         isFrontend: false,
         isBackend: true,
         toolCallId: event.toolCallId,
