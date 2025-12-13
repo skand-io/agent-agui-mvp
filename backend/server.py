@@ -16,7 +16,16 @@ import uuid
 import time
 import hashlib
 import httpx
+import logging
 from pathlib import Path
+
+# Configure logging with timestamps and colors for terminal
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s.%(msecs)03d | %(levelname)-5s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -391,10 +400,43 @@ Important: This context may have changed since earlier messages. Always use this
                 "content": f"{context_preamble}\n\n{context}"
             })
 
-        openai_messages.append({
-            "role": msg.get("role", "user"),
-            "content": msg.get("content", "")
-        })
+        role = msg.get("role", "user")
+
+        # Handle tool result messages (from previous tool executions in chained calls)
+        if role == "tool":
+            tool_call_id = msg.get("toolCallId") or msg.get("tool_call_id") or "unknown"
+            openai_messages.append({
+                "role": "tool",
+                "content": msg.get("content", ""),
+                "tool_call_id": tool_call_id,
+            })
+        # Handle assistant messages (may have tool_calls attached)
+        elif role == "assistant":
+            assistant_msg = {
+                "role": "assistant",
+                "content": msg.get("content", "")
+            }
+            # If the assistant message has tool_calls, include them for proper threading
+            if msg.get("toolCalls") or msg.get("tool_calls"):
+                tool_calls_data = msg.get("toolCalls") or msg.get("tool_calls") or []
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.get("id", "unknown"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("name", ""),
+                            "arguments": tc.get("arguments", "{}")
+                        }
+                    }
+                    for tc in tool_calls_data
+                ]
+            openai_messages.append(assistant_msg)
+        else:
+            # Regular user/system messages
+            openai_messages.append({
+                "role": role,
+                "content": msg.get("content", "")
+            })
 
     return openai_messages
 
@@ -418,12 +460,24 @@ async def chat(request: Request):
     - Context is regenerated fresh each turn, never stored in history
     - This prevents stale context from accumulating in the conversation
     """
+    request_start = time.time()
+    logger.info("=" * 60)
+    logger.info("📥 REQUEST RECEIVED")
+
     data = await request.json()
     messages = data.get("messages", [])
     frontend_tools = data.get("frontendTools", [])
     thread_id = data.get("threadId", str(uuid.uuid4()))
     run_id = data.get("runId", str(uuid.uuid4()))
     context = data.get("context")  # App context from frontend (injected fresh each turn)
+
+    # Log request details
+    logger.info(f"   Thread: {thread_id[:8]}... | Run: {run_id[:8]}...")
+    logger.info(f"   Messages: {len(messages)} | Frontend tools: {len(frontend_tools)} | Context: {'yes' if context else 'no'}")
+    if messages:
+        last_msg = messages[-1]
+        content_preview = last_msg.get('content', '')[:50]
+        logger.info(f"   Last message ({last_msg.get('role')}): {content_preview}...")
 
     # Build tool list: backend tools + frontend tools
     all_tools = []
@@ -438,11 +492,21 @@ async def chat(request: Request):
         all_tools.append(to_openai_tool(tool["name"], tool))
         frontend_tool_names.add(tool["name"])
 
+    logger.info(f"   Total tools: {len(all_tools)} (backend: {len(BACKEND_TOOLS)}, frontend: {len(frontend_tool_names)})")
+
     # Build messages with context injected before the latest user message
+    build_start = time.time()
     openai_messages = build_messages_with_context(messages, context, thread_id)
+    build_time = (time.time() - build_start) * 1000
+    logger.info(f"   Message building: {build_time:.1f}ms | Total messages to LLM: {len(openai_messages)}")
 
     async def generate():
+        nonlocal request_start
+        stream_start = time.time()
+
         try:
+            logger.info("🚀 STARTING STREAM")
+
             # RUN_STARTED event (AG-UI protocol)
             # Note: input field requires RunAgentInput type which is complex,
             # so we omit it for simplicity (it's optional per spec)
@@ -459,6 +523,9 @@ async def chat(request: Request):
             ))
 
             # Call OpenRouter with streaming
+            logger.info(f"🤖 CALLING LLM: {MODEL}")
+            llm_call_start = time.time()
+
             stream = client.chat.completions.create(
                 model=MODEL,
                 messages=openai_messages,
@@ -469,8 +536,17 @@ async def chat(request: Request):
             current_tool_calls = {}  # Track multiple tool calls by index
             message_id = None
             text_started = False
+            first_chunk_received = False
+            chunk_count = 0
 
             for chunk in stream:
+                chunk_count += 1
+
+                # Log time to first chunk
+                if not first_chunk_received:
+                    first_chunk_time = (time.time() - llm_call_start) * 1000
+                    logger.info(f"   ⚡ First chunk received: {first_chunk_time:.0f}ms")
+                    first_chunk_received = True
                 if not chunk.choices:
                     continue
 
@@ -514,6 +590,7 @@ async def chat(request: Request):
                         # Update function name if provided and emit TOOL_CALL_START
                         if tc.function and tc.function.name:
                             tool_call["name"] = tc.function.name
+                            logger.info(f"   🔧 Tool call detected: {tool_call['name']}")
                             yield encoder.encode(ToolCallStartEvent(
                                 tool_call_id=tool_call["id"],
                                 tool_call_name=tool_call["name"],
@@ -532,6 +609,10 @@ async def chat(request: Request):
                 if finish_reason == "stop" and text_started:
                     yield encoder.encode(TextMessageEndEvent(message_id=message_id))
 
+            # Log LLM streaming complete
+            llm_total_time = (time.time() - llm_call_start) * 1000
+            logger.info(f"   ✅ LLM streaming complete: {llm_total_time:.0f}ms ({chunk_count} chunks)")
+
             # STEP_FINISHED: LLM inference complete
             yield encoder.encode(StepFinishedEvent(
                 step_name="llm_inference",
@@ -540,6 +621,7 @@ async def chat(request: Request):
 
             # Process completed tool calls
             if current_tool_calls:
+                logger.info(f"🔧 EXECUTING {len(current_tool_calls)} TOOL(S)")
                 # STEP_STARTED: Tool execution
                 yield encoder.encode(StepStartedEvent(
                     step_name="tool_execution",
@@ -555,10 +637,16 @@ async def chat(request: Request):
 
                 # Execute backend tools and stream result
                 if tool_name in BACKEND_TOOLS:
+                    tool_start = time.time()
+                    logger.info(f"   🔨 Executing: {tool_name}")
                     try:
                         args = json.loads(tool_call["arguments"]) if tool_call["arguments"] else {}
                         handler = BACKEND_TOOLS[tool_name]["handler"]
                         result = handler(**args)
+
+                        tool_time = (time.time() - tool_start) * 1000
+                        result_preview = result[:50] if len(result) > 50 else result
+                        logger.info(f"   ✅ {tool_name} completed: {tool_time:.0f}ms | Result: {result_preview}...")
 
                         # TOOL_CALL_RESULT with result
                         result_message_id = str(uuid.uuid4())
@@ -569,6 +657,8 @@ async def chat(request: Request):
                             role="tool"
                         ))
                     except Exception as e:
+                        tool_time = (time.time() - tool_start) * 1000
+                        logger.error(f"   ❌ {tool_name} failed: {tool_time:.0f}ms | Error: {str(e)}")
                         result_message_id = str(uuid.uuid4())
                         yield encoder.encode(ToolCallResultEvent(
                             message_id=result_message_id,
@@ -576,7 +666,9 @@ async def chat(request: Request):
                             content=f"Error: {str(e)}",
                             role="tool"
                         ))
-                # Frontend tools: no result from server (client executes them)
+                else:
+                    # Frontend tools: no result from server (client executes them)
+                    logger.info(f"   📤 Frontend tool: {tool_name} (client will execute)")
 
             # STEP_FINISHED: Tool execution complete
             if current_tool_calls:
@@ -584,6 +676,15 @@ async def chat(request: Request):
                     step_name="tool_execution",
                     timestamp=get_timestamp()
                 ))
+
+            # Final summary
+            total_time = (time.time() - request_start) * 1000
+            stream_time = (time.time() - stream_start) * 1000
+            logger.info(f"📤 STREAM COMPLETE")
+            logger.info(f"   Total request time: {total_time:.0f}ms")
+            logger.info(f"   Stream duration: {stream_time:.0f}ms")
+            logger.info(f"   Tool calls: {len(current_tool_calls)}")
+            logger.info("=" * 60)
 
             # RUN_FINISHED event with result and timestamp (AG-UI protocol compliance)
             yield encoder.encode(RunFinishedEvent(
@@ -598,6 +699,7 @@ async def chat(request: Request):
             ))
 
         except Exception as e:
+            logger.error(f"❌ STREAM ERROR: {str(e)}")
             yield encoder.encode(RunErrorEvent(message=str(e), code="RUNTIME_ERROR"))
 
     return StreamingResponse(
