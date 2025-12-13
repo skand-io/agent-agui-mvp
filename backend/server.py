@@ -10,6 +10,8 @@ AG-UI Protocol Events:
 import os
 import json
 import uuid
+import hashlib
+import httpx
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -171,17 +173,95 @@ When unsure, use this tool. Proactive task management shows attentiveness and he
 """.strip()
 
 
+def get_weather(city: str) -> str:
+    """
+    Get real weather data for a city using Open-Meteo API (free, no API key needed).
+
+    1. Geocode city name to coordinates using Open-Meteo Geocoding API
+    2. Fetch current weather using Open-Meteo Weather API
+    """
+    try:
+        # Step 1: Geocode the city name to get coordinates
+        geocode_url = "https://geocoding-api.open-meteo.com/v1/search"
+        geocode_params = {"name": city, "count": 1, "language": "en", "format": "json"}
+
+        with httpx.Client(timeout=10.0) as client:
+            geo_response = client.get(geocode_url, params=geocode_params)
+            geo_response.raise_for_status()
+            geo_data = geo_response.json()
+
+            if not geo_data.get("results"):
+                return f"Could not find location: {city}"
+
+            location = geo_data["results"][0]
+            lat = location["latitude"]
+            lon = location["longitude"]
+            location_name = location.get("name", city)
+            country = location.get("country", "")
+
+            # Step 2: Fetch current weather
+            weather_url = "https://api.open-meteo.com/v1/forecast"
+            weather_params = {
+                "latitude": lat,
+                "longitude": lon,
+                "current": ["temperature_2m", "relative_humidity_2m", "apparent_temperature",
+                           "weather_code", "wind_speed_10m", "wind_direction_10m"],
+                "temperature_unit": "celsius",
+                "wind_speed_unit": "kmh",
+            }
+
+            weather_response = client.get(weather_url, params=weather_params)
+            weather_response.raise_for_status()
+            weather_data = weather_response.json()
+
+            current = weather_data.get("current", {})
+
+            # Weather code to description mapping (WMO codes)
+            weather_codes = {
+                0: "Clear sky",
+                1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+                45: "Foggy", 48: "Depositing rime fog",
+                51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+                61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+                71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
+                80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+                95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
+            }
+
+            weather_code = current.get("weather_code", 0)
+            condition = weather_codes.get(weather_code, "Unknown")
+            temp = current.get("temperature_2m", "N/A")
+            feels_like = current.get("apparent_temperature", "N/A")
+            humidity = current.get("relative_humidity_2m", "N/A")
+            wind_speed = current.get("wind_speed_10m", "N/A")
+
+            return (
+                f"Weather in {location_name}, {country}:\n"
+                f"• Condition: {condition}\n"
+                f"• Temperature: {temp}°C (feels like {feels_like}°C)\n"
+                f"• Humidity: {humidity}%\n"
+                f"• Wind: {wind_speed} km/h"
+            )
+
+    except httpx.TimeoutException:
+        return f"Weather service timed out. Please try again."
+    except httpx.HTTPStatusError as e:
+        return f"Weather service error: {e.response.status_code}"
+    except Exception as e:
+        return f"Error fetching weather: {str(e)}"
+
+
 BACKEND_TOOLS = {
     "get_weather": {
-        "description": "Get the current weather for a city",
+        "description": "Get the current weather for a city. Returns temperature, conditions, humidity, and wind speed.",
         "parameters": {
             "type": "object",
             "properties": {
-                "city": {"type": "string", "description": "The city name"}
+                "city": {"type": "string", "description": "The city name (e.g., 'Tokyo', 'New York', 'London')"}
             },
             "required": ["city"]
         },
-        "handler": lambda city: f"Weather in {city}: 22°C, Sunny with light clouds"
+        "handler": get_weather
     },
     "calculate": {
         "description": "Perform a mathematical calculation",
@@ -234,6 +314,71 @@ def to_openai_tool(name: str, tool: dict) -> dict:
 
 
 
+# Cache for tracking context changes per thread
+_context_cache: dict[str, str] = {}
+
+
+def build_messages_with_context(
+    messages: list,
+    context: str | None,
+    thread_id: str | None = None
+) -> list:
+    """
+    Build OpenAI messages with context injected BEFORE the latest user message.
+
+    PostHog-style context injection:
+    - Context is NOT stored in message history
+    - Context is injected fresh each turn, right before the latest user message
+    - This prevents stale context from polluting the conversation
+    - Detects context changes and notifies the LLM
+
+    Message order: [...history, context_message, latest_user_message]
+    """
+    openai_messages = []
+
+    if not messages:
+        return openai_messages
+
+    # Find the index of the last user message
+    last_user_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+
+    # Detect if context has changed since last turn
+    context_changed = False
+    if context and thread_id:
+        context_hash = hashlib.md5(context.encode()).hexdigest()
+        previous_hash = _context_cache.get(thread_id)
+        if previous_hash and previous_hash != context_hash:
+            context_changed = True
+        _context_cache[thread_id] = context_hash
+
+    # Build messages, injecting context before the last user message
+    for i, msg in enumerate(messages):
+        # Inject context right before the last user message
+        if i == last_user_idx and context:
+            context_preamble = """[CURRENT APPLICATION CONTEXT]
+This is the current state of the application. It is injected fresh each turn and reflects the CURRENT state.
+Important: This context may have changed since earlier messages. Always use this current context, not any previously mentioned state."""
+
+            if context_changed:
+                context_preamble += "\n\n⚠️ NOTE: The application context has CHANGED since the previous turn. Please use this updated context."
+
+            openai_messages.append({
+                "role": "system",
+                "content": f"{context_preamble}\n\n{context}"
+            })
+
+        openai_messages.append({
+            "role": msg.get("role", "user"),
+            "content": msg.get("content", "")
+        })
+
+    return openai_messages
+
+
 @app.post("/chat")
 async def chat(request: Request):
     """
@@ -244,14 +389,21 @@ async def chat(request: Request):
         "messages": [{"role": "user", "content": "..."}],
         "frontendTools": [{"name": "greet", "description": "...", "parameters": {...}}],
         "threadId": "optional-thread-id",
-        "runId": "optional-run-id"
+        "runId": "optional-run-id",
+        "context": "optional app context string to inject into system prompt"
     }
+
+    Context Handling (PostHog-style):
+    - Context is injected BEFORE the latest user message, not at the start
+    - Context is regenerated fresh each turn, never stored in history
+    - This prevents stale context from accumulating in the conversation
     """
     data = await request.json()
     messages = data.get("messages", [])
     frontend_tools = data.get("frontendTools", [])
     thread_id = data.get("threadId", str(uuid.uuid4()))
     run_id = data.get("runId", str(uuid.uuid4()))
+    context = data.get("context")  # App context from frontend (injected fresh each turn)
 
     # Build tool list: backend tools + frontend tools
     all_tools = []
@@ -266,13 +418,8 @@ async def chat(request: Request):
         all_tools.append(to_openai_tool(tool["name"], tool))
         frontend_tool_names.add(tool["name"])
 
-    # Convert messages to OpenAI format
-    openai_messages = []
-    for msg in messages:
-        openai_messages.append({
-            "role": msg.get("role", "user"),
-            "content": msg.get("content", "")
-        })
+    # Build messages with context injected before the latest user message
+    openai_messages = build_messages_with_context(messages, context, thread_id)
 
     async def generate():
         try:

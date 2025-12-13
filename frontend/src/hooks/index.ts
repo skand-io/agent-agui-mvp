@@ -1,5 +1,6 @@
-export { useChat, useChatWithContext } from './useChat';
+export { useChatWithContext } from './useChat';
 export { useCopilotAction } from './useCopilotAction';
-export { useCopilotReadable } from './useCopilotReadable';
 export type { UseCopilotActionOptions } from './useCopilotAction';
+export { useCopilotReadable } from './useCopilotReadable';
 export type { UseCopilotReadableOptions } from './useCopilotReadable';
+
