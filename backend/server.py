@@ -16,7 +16,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
-from typing import Optional, Any
 
 # Import AG-UI types from pydantic
 from ag_ui.core import (
@@ -50,13 +49,13 @@ env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 # OpenRouter client
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-MODEL = os.environ.get("MODEL", "amazon/nova-2-lite-v1:free")
-
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
+    api_key=os.environ.get("OPENROUTER_API_KEY"),
 )
+
+MODEL = os.environ.get("MODEL", "deepseek/deepseek-v3.2")
+print(f"Using model: {MODEL}")
 
 
 # Initialize AG-UI event encoder

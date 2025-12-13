@@ -1,12 +1,12 @@
 import { useRef, useEffect } from 'react';
-import { useChat } from '../hooks/useChat';
+import { useChatWithContext } from '../hooks/useChat';
 import { Message } from './Message';
 import { InputArea } from './InputArea';
 import { Loading } from './Loading';
 import styles from './ChatContainer.module.css';
 
 export function ChatContainer() {
-  const { messages, isLoading, sendMessage } = useChat();
+  const { messages, isLoading, sendMessage } = useChatWithContext();
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {

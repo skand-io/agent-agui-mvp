@@ -51,3 +51,32 @@ export interface AGUIEvent {
   message?: string;
   role?: string;
 }
+
+// CopilotKit-like types for dynamic action registration
+export interface CopilotActionParameter {
+  name: string;
+  type: 'string' | 'number' | 'boolean' | 'object';
+  description: string;
+  required?: boolean;
+}
+
+export interface CopilotAction {
+  name: string;
+  description: string;
+  parameters: CopilotActionParameter[];
+  handler: (args: Record<string, unknown>) => string | Promise<string>;
+  disableFollowUp?: boolean;
+}
+
+export interface CopilotContextValue {
+  messages: Message[];
+  isLoading: boolean;
+  actions: Map<string, CopilotAction>;
+  sendMessage: (content: string) => Promise<void>;
+  registerAction: (action: CopilotAction) => void;
+  unregisterAction: (name: string) => void;
+  // Readable context for exposing app state to the LLM
+  addReadableContext: (content: string, parentId?: string) => string;
+  removeReadableContext: (id: string) => void;
+  getContextString: () => string;
+}
