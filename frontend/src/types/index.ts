@@ -21,6 +21,18 @@ export interface Message {
   isFrontend?: boolean;
   isBackend?: boolean;
   toolCallId?: string;
+  // Store tool calls for rendering (e.g., todo_write)
+  toolCalls?: Array<{
+    id: string;
+    name: string;
+    arguments: string;
+  }>;
+}
+
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
 }
 
 export interface ToolDefinition {
@@ -75,8 +87,8 @@ export interface CopilotContextValue {
   sendMessage: (content: string) => Promise<void>;
   registerAction: (action: CopilotAction) => void;
   unregisterAction: (name: string) => void;
-  // Readable context for exposing app state to the LLM
-  addReadableContext: (content: string, parentId?: string) => string;
-  removeReadableContext: (id: string) => void;
-  getContextString: () => string;
+  // Readable context for exposing app state to the LLM (matches CopilotKit API)
+  addContext: (context: string, parentId?: string, categories?: string[]) => string;
+  removeContext: (id: string) => void;
+  getContextString: (categories?: string[]) => string;
 }

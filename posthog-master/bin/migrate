@@ -1,0 +1,147 @@
+#!/bin/bash
+set -e              # Exit on any command failure
+set -o pipefail     # Exit if any command in a pipeline fails
+
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+
+# NOTE when running in docker, rust might not exist so we need to check for it
+if [ -d "$SCRIPT_DIR/../rust/bin" ]; then
+    bash $SCRIPT_DIR/../rust/bin/migrate-cyclotron
+    if [ $? -ne 0 ]; then
+        echo "Error in rust/bin/migrate-cyclotron, exiting."
+        exit 1
+    fi
+
+    echo "Running persons migrations via external non-django migrator..."
+    bash $SCRIPT_DIR/../rust/bin/migrate-persons
+    if [ $? -ne 0 ]; then
+        echo "Error in rust/bin/migrate-persons, exiting."
+        exit 1
+    fi
+
+    echo "Running behavioral cohorts migrations via external non-django migrator..."
+    bash $SCRIPT_DIR/../rust/bin/migrate-behavioral-cohorts
+    if [ $? -ne 0 ]; then
+        echo "Error in rust/bin/migrate-behavioral-cohorts, exiting."
+        exit 1
+    fi
+fi
+
+# Create a temporary file for background process status
+# Ensure cleanup of temp file on script exit
+trap 'rm -f "$CLICKHOUSE_STATUS" 2>/dev/null' EXIT
+CLICKHOUSE_STATUS=$(mktemp)
+echo "0" > $CLICKHOUSE_STATUS
+
+# Run ClickHouse migrations in the background but track their status
+(
+    # Run migrations and capture status
+    python manage.py migrate_clickhouse
+    CH_MIGRATE_STATUS=$?
+    if [ $CH_MIGRATE_STATUS -ne 0 ]; then
+        echo "Error in migrate_clickhouse, setting error status."
+        echo "1" > $CLICKHOUSE_STATUS
+        exit $CH_MIGRATE_STATUS
+    fi
+
+    python manage.py sync_replicated_schema
+    SYNC_STATUS=$?
+    if [ $SYNC_STATUS -ne 0 ]; then
+        echo "Error in sync_replicated_schema, setting error status."
+        echo "1" > $CLICKHOUSE_STATUS
+        exit $SYNC_STATUS
+    fi
+) & # ClickHouse migrations can run in parallel to Postgres ones
+CLICKHOUSE_PID=$!
+
+# Run postgres migrations with retry logic
+# If POSTHOG_POSTGRES_DIRECT_HOST is set, use direct connection (bypasses PgBouncer)
+# which allows lock_timeout to be set in Django database OPTIONS
+MIGRATE_MAX_RETRIES=${MIGRATE_MAX_RETRIES:-10}
+MIGRATE_RETRY_DELAY=${MIGRATE_RETRY_DELAY:-3}
+MIGRATE_BACKOFF=${MIGRATE_BACKOFF:-2}
+
+MIGRATE_ATTEMPT=1
+MIGRATE_SUCCESS=false
+MIGRATE_START_TIME=$(date +%s.%N)
+
+# Build migrate command - use direct connection if available
+if [ -n "$POSTHOG_POSTGRES_DIRECT_HOST" ]; then
+    MIGRATE_CMD="python manage.py migrate --noinput --database=default_direct"
+    echo "[migrate] Using direct database connection (lock_timeout enabled)"
+else
+    MIGRATE_CMD="python manage.py migrate --noinput"
+fi
+
+while [ $MIGRATE_ATTEMPT -le $MIGRATE_MAX_RETRIES ]; do
+    echo "[migrate] Django migration attempt $MIGRATE_ATTEMPT/$MIGRATE_MAX_RETRIES"
+
+    if $MIGRATE_CMD; then
+        MIGRATE_SUCCESS=true
+        break
+    fi
+
+    echo "[migrate] Django migration failed"
+
+    if [ $MIGRATE_ATTEMPT -ge $MIGRATE_MAX_RETRIES ]; then
+        echo "[migrate] max retries reached, aborting"
+        break
+    fi
+
+    echo "[migrate] waiting ${MIGRATE_RETRY_DELAY}s before retry..."
+    sleep $MIGRATE_RETRY_DELAY
+
+    MIGRATE_RETRY_DELAY=$((MIGRATE_RETRY_DELAY * MIGRATE_BACKOFF))
+    MIGRATE_ATTEMPT=$((MIGRATE_ATTEMPT + 1))
+done
+
+MIGRATE_END_TIME=$(date +%s.%N)
+MIGRATE_DURATION=$(python3 -c "print($MIGRATE_END_TIME - $MIGRATE_START_TIME)")
+
+# Report migration metrics to pushgateway (if configured)
+if [ "$MIGRATE_SUCCESS" = "true" ]; then
+    python manage.py report_migration_metric --attempts=$MIGRATE_ATTEMPT --duration=$MIGRATE_DURATION --success || true
+else
+    python manage.py report_migration_metric --attempts=$MIGRATE_ATTEMPT --duration=$MIGRATE_DURATION || true
+    echo "Error in postgres migrations, killing background process and exiting."
+    kill $CLICKHOUSE_PID 2>/dev/null || true
+    rm $CLICKHOUSE_STATUS
+    exit 1
+fi
+
+# NOTE: we do not apply any non-noop migrations here. Rather these are run
+# manually within the UI. See https://posthog.com/docs/runbook/async-migrations
+# for details.
+python manage.py run_async_migrations --complete-noop-migrations
+if [ $? -ne 0 ]; then
+    echo "Error in run_async_migrations, killing background process and exiting."
+    kill $CLICKHOUSE_PID 2>/dev/null || true
+    rm $CLICKHOUSE_STATUS
+    exit 1
+fi
+
+# NOTE: this check should not fail if a migration isn't complete but within the
+# given async migration posthog version range, thus this should not block e.g.
+# k8s pod deployments.
+python manage.py run_async_migrations --check
+if [ $? -ne 0 ]; then
+    echo "Error in run_async_migrations --check, killing background process and exiting."
+    kill $CLICKHOUSE_PID 2>/dev/null || true
+    rm $CLICKHOUSE_STATUS
+    exit 1
+fi
+
+# Wait for background ClickHouse migrations to complete
+wait $CLICKHOUSE_PID
+CLICKHOUSE_WAIT_STATUS=$?
+
+# Check the status of the ClickHouse migrations
+CH_STATUS=$(cat $CLICKHOUSE_STATUS)
+rm $CLICKHOUSE_STATUS
+
+if [ "$CH_STATUS" != "0" ] || [ $CLICKHOUSE_WAIT_STATUS -ne 0 ]; then
+    echo "Error in ClickHouse migrations, exiting."
+    exit 1
+fi
+
+echo "All migrations completed successfully."

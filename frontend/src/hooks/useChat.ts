@@ -323,6 +323,31 @@ async function handleEventWithContext(
       if (!event.toolCallId) break;
       const toolCall = toolCalls[event.toolCallId];
 
+      // For todo_write, attach to the last assistant message for UI rendering
+      if (toolCall.name === 'todo_write') {
+        const updated = [...currentMessages];
+        // Find last assistant message index
+        let lastAssistantIdx = -1;
+        for (let i = updated.length - 1; i >= 0; i--) {
+          if (updated[i].role === 'assistant') {
+            lastAssistantIdx = i;
+            break;
+          }
+        }
+        if (lastAssistantIdx >= 0) {
+          const msg = updated[lastAssistantIdx];
+          msg.toolCalls = msg.toolCalls || [];
+          msg.toolCalls.push({
+            id: event.toolCallId,
+            name: toolCall.name,
+            arguments: toolCall.arguments,
+          });
+          setMessages(updated);
+        }
+        // Don't return - let the backend handle the TOOL_CALL_RESULT
+        break;
+      }
+
       // First check context actions, then static tools
       const contextAction = actions.get(toolCall.name);
       const staticTool = FRONTEND_TOOLS[toolCall.name];
@@ -476,6 +501,33 @@ function handleEvent(
     case EventType.TOOL_CALL_END: {
       if (!event.toolCallId) break;
       const toolCall = toolCalls[event.toolCallId];
+
+      // For todo_write, attach to the last assistant message for UI rendering
+      if (toolCall && toolCall.name === 'todo_write') {
+        setMessages((prev) => {
+          const updated = [...prev];
+          // Find last assistant message index
+          let lastAssistantIdx = -1;
+          for (let i = updated.length - 1; i >= 0; i--) {
+            if (updated[i].role === 'assistant') {
+              lastAssistantIdx = i;
+              break;
+            }
+          }
+          if (lastAssistantIdx >= 0) {
+            const msg = updated[lastAssistantIdx];
+            msg.toolCalls = msg.toolCalls || [];
+            msg.toolCalls.push({
+              id: event.toolCallId!,
+              name: toolCall.name,
+              arguments: toolCall.arguments,
+            });
+          }
+          return updated;
+        });
+        break;
+      }
+
       if (toolCall && FRONTEND_TOOLS[toolCall.name]) {
         try {
           const args = JSON.parse(toolCall.arguments || '{}');

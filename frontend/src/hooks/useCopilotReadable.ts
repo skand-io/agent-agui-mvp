@@ -1,59 +1,100 @@
 import { useEffect, useRef } from 'react';
 import { useCopilotContext } from '../context/CopilotContext';
 
+/**
+ * Options for the useCopilotReadable hook.
+ * Matches CopilotKit's API.
+ */
 export interface UseCopilotReadableOptions {
   /**
-   * A description of what this context represents
+   * The description of the information to be added to the Copilot context.
    */
   description: string;
   /**
-   * The value to expose to the LLM. Objects are automatically JSON stringified.
+   * The value to be added to the Copilot context. Object values are automatically stringified.
    */
   value: unknown;
   /**
-   * Optional parent ID for hierarchical context
+   * The ID of the parent context, if any.
    */
   parentId?: string;
+  /**
+   * An array of categories to control which contexts are visible where.
+   */
+  categories?: string[];
+  /**
+   * Whether the context is available to the Copilot.
+   */
+  available?: 'enabled' | 'disabled';
+  /**
+   * A custom conversion function to use to serialize the value to a string.
+   * If not provided, the value will be serialized using JSON.stringify.
+   */
+  convert?: (description: string, value: unknown) => string;
+}
+
+function convertToJSON(description: string, value: unknown): string {
+  return `${description}: ${typeof value === 'string' ? value : JSON.stringify(value)}`;
 }
 
 /**
- * Hook to expose app state/context to the LLM.
- * This helps the LLM understand what data is available and make better decisions
- * about which tools to use.
+ * Adds the given information to the Copilot context to make it readable by Copilot.
  *
  * @example
  * ```tsx
- * function TodoList() {
- *   const [todos, setTodos] = useState([]);
+ * function MyComponent() {
+ *   const [employees, setEmployees] = useState([]);
  *
- *   // Makes the todo list visible to the LLM
  *   useCopilotReadable({
- *     description: "The current todo list items",
- *     value: todos,
+ *     description: "The list of employees",
+ *     value: employees,
+ *   });
+ * }
+ * ```
+ *
+ * @example Nested context with parentId
+ * ```tsx
+ * function Employee({ name, workProfile }) {
+ *   const employeeContextId = useCopilotReadable({
+ *     description: "Employee name",
+ *     value: name
+ *   });
+ *
+ *   useCopilotReadable({
+ *     description: "Work profile",
+ *     value: workProfile,
+ *     parentId: employeeContextId
  *   });
  * }
  * ```
  */
 export function useCopilotReadable(
-  options: UseCopilotReadableOptions,
-  dependencies?: unknown[]
+  {
+    description,
+    value,
+    parentId,
+    categories,
+    convert,
+    available = 'enabled',
+  }: UseCopilotReadableOptions,
+  dependencies?: unknown[],
 ): string | undefined {
-  const { addReadableContext, removeReadableContext } = useCopilotContext();
+  const { addContext, removeContext } = useCopilotContext();
   const idRef = useRef<string>();
+  const convertFn = convert || convertToJSON;
 
-  const serialized = typeof options.value === 'string'
-    ? options.value
-    : JSON.stringify(options.value);
-  const contextString = `${options.description}: ${serialized}`;
+  const information = convertFn(description, value);
 
   useEffect(() => {
-    const id = addReadableContext(contextString, options.parentId);
+    if (available === 'disabled') return;
+
+    const id = addContext(information, parentId, categories);
     idRef.current = id;
 
     return () => {
-      removeReadableContext(id);
+      removeContext(id);
     };
-  }, [contextString, options.parentId, addReadableContext, removeReadableContext, ...(dependencies || [])]);
+  }, [available, information, parentId, addContext, removeContext, ...(dependencies || [])]);
 
   return idRef.current;
 }

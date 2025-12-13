@@ -1,0 +1,18 @@
+debug: true
+kafka:
+    brokers: 'localhost:9092,localhost:9093'
+    topic: 'topic'
+    session_recording_enabled: true  # set to false to disable session recording stats
+    session_recording_topic: 'session_recording_snapshot_item_events'  # defaults to this value when enabled
+    # session_recording_brokers: 'localhost:9094'  # optional, defaults to brokers
+    group_id: 'livestream-dev'
+mmdb:
+    path: 'mmdb.db'
+jwt:
+    token: '<randomly generated secret key>'
+postgres:
+    url: 'postgres://postgres:postgres@localhost:5432/postgres'
+cors_allow_origins:
+    - "https://example.com"
+    - "https://sub.example.com"
+parallelism: 7

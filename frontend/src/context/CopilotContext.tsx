@@ -1,25 +1,23 @@
-import React, { createContext, useContext, useState, useCallback, useMemo, useRef } from 'react';
+import React, { createContext, useContext, useState, useCallback, useMemo } from 'react';
 import type { Message, CopilotAction, CopilotContextValue } from '../types';
+import { useTree, type TreeNodeId } from '../hooks/useTree';
 
 const CopilotContext = createContext<CopilotContextValue | null>(null);
 
-interface ReadableContext {
-  id: string;
-  content: string;
-  parentId?: string;
-}
+// Default category for contexts (matches CopilotKit)
+export const defaultCopilotContextCategories = ['global'];
 
 interface CopilotProviderProps {
   children: React.ReactNode;
 }
 
-let contextIdCounter = 0;
-
 export function CopilotProvider({ children }: CopilotProviderProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [actions, setActions] = useState<Map<string, CopilotAction>>(new Map());
-  const readableContextsRef = useRef<Map<string, ReadableContext>>(new Map());
+
+  // Use tree for readable contexts (matches CopilotKit's approach)
+  const { addElement, removeElement, printTree } = useTree();
 
   const registerAction = useCallback((action: CopilotAction) => {
     setActions((prev) => {
@@ -37,33 +35,26 @@ export function CopilotProvider({ children }: CopilotProviderProps) {
     });
   }, []);
 
-  const addReadableContext = useCallback((content: string, parentId?: string): string => {
-    const id = `ctx_${++contextIdCounter}`;
-    readableContextsRef.current.set(id, { id, content, parentId });
-    return id;
-  }, []);
+  const addContext = useCallback(
+    (context: string, parentId?: string, categories: string[] = defaultCopilotContextCategories): TreeNodeId => {
+      return addElement(context, categories, parentId);
+    },
+    [addElement],
+  );
 
-  const removeReadableContext = useCallback((id: string) => {
-    readableContextsRef.current.delete(id);
-  }, []);
+  const removeContext = useCallback(
+    (id: TreeNodeId): void => {
+      removeElement(id);
+    },
+    [removeElement],
+  );
 
-  const getContextString = useCallback((): string => {
-    const contexts = Array.from(readableContextsRef.current.values());
-    if (contexts.length === 0) return '';
-
-    // Build hierarchical context string
-    const rootContexts = contexts.filter(c => !c.parentId);
-    const childContexts = contexts.filter(c => c.parentId);
-
-    const buildContextTree = (context: ReadableContext, indent = 0): string => {
-      const prefix = '  '.repeat(indent);
-      const children = childContexts.filter(c => c.parentId === context.id);
-      const childrenStr = children.map(c => buildContextTree(c, indent + 1)).join('\n');
-      return `${prefix}- ${context.content}${childrenStr ? '\n' + childrenStr : ''}`;
-    };
-
-    return rootContexts.map(c => buildContextTree(c)).join('\n');
-  }, []);
+  const getContextString = useCallback(
+    (categories: string[] = defaultCopilotContextCategories): string => {
+      return printTree(categories);
+    },
+    [printTree],
+  );
 
   const sendMessage = useCallback(async (content: string) => {
     // TODO: Implement actual message sending logic
@@ -81,11 +72,11 @@ export function CopilotProvider({ children }: CopilotProviderProps) {
       sendMessage,
       registerAction,
       unregisterAction,
-      addReadableContext,
-      removeReadableContext,
+      addContext,
+      removeContext,
       getContextString,
     }),
-    [messages, isLoading, actions, sendMessage, registerAction, unregisterAction, addReadableContext, removeReadableContext, getContextString]
+    [messages, isLoading, actions, sendMessage, registerAction, unregisterAction, addContext, removeContext, getContextString]
   );
 
   return (

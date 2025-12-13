@@ -63,6 +63,114 @@ encoder = EventEncoder()
 
 
 # Backend tools - these execute on the server
+
+# TodoWrite tool prompt - follows PostHog's ee/hogai pattern
+TODO_WRITE_PROMPT = """
+Use this tool to build and maintain a structured to-do list for the current session. It helps you monitor progress, organize complex work, and show thoroughness.
+
+# When to use this tool
+Use it proactively in these situations:
+
+1. Complex, multi-step work – when a task needs 3+ distinct steps or actions
+2. Non-trivial tasks – work that requires careful planning or multiple operations
+3. User explicitly asks for a to-do list – when they request it directly
+4. User supplies multiple tasks – e.g., a numbered or comma-separated list
+5. After new instructions arrive – immediately capture the requirements as to-dos
+6. When you begin a task – set it to `in_progress` BEFORE starting; ideally only one `in_progress` item at a time
+7. After finishing a task – mark it `completed` and add any follow-ups discovered during execution
+
+# When NOT to use this tool
+Skip it when:
+1. There's only a single, straightforward task
+2. The task is trivial and tracking adds no organizational value
+3. It can be finished in fewer than 3 trivial steps
+4. The exchange is purely conversational or informational
+
+NOTE: If there's just one trivial task, don't use the tool–simply do the task directly.
+
+# Examples of when to use the todo list
+
+<example>
+User: Help me build a login page with form validation, error handling, and password reset
+Assistant: I'll help you build a login page. Let me create a todo list to track this.
+*Creates todo list:*
+1. Create login form component
+2. Add form validation logic
+3. Implement error handling and display
+4. Add password reset flow
+
+<reasoning>
+The assistant used the todo list because:
+1. Building a login page involves multiple components and concerns
+2. The user explicitly mentioned several features (validation, error handling, reset)
+3. Each feature requires distinct implementation steps
+</reasoning>
+</example>
+
+<example>
+User: I need to implement user authentication, set up a database, and create API endpoints for my app
+Assistant: I'll help you implement these features. Let me create a todo list to track this work.
+*Creates todo list:*
+1. Set up database schema and connection
+2. Implement user authentication system
+3. Create API endpoints
+
+<reasoning>
+The assistant used the todo list because:
+1. The user provided multiple distinct features to implement
+2. Each feature is a complex task requiring multiple steps
+3. The todo list helps track progress across all features
+</reasoning>
+</example>
+
+# Examples of when NOT to use the todo list
+
+<example>
+User: What does the useState hook do in React?
+Assistant: useState is a React hook that lets you add state to functional components...
+
+<reasoning>
+The assistant did not use the todo list because this is a single, informational request. There's no implementation work to track.
+</reasoning>
+</example>
+
+<example>
+User: Fix the typo on line 42
+Assistant: *Fixes the typo*
+
+<reasoning>
+The assistant did not use the todo list because this is a single, trivial task that can be completed in one step.
+</reasoning>
+</example>
+
+# Task states and management
+
+1. **Task States**: Use these states to track progress:
+  - pending: Task not yet started
+  - in_progress: Currently working on (limit to ONE task at a time)
+  - completed: Finished successfully
+
+2. **Managing Tasks**:
+  - Update statuses in real time as you work
+  - Mark tasks complete IMMEDIATELY when done–don't batch them
+  - Keep only ONE task `in_progress` at any moment
+  - Finish the current task before starting another
+  - Remove tasks that are no longer relevant
+
+3. **Completion Rules**:
+  - Mark a task `completed` only when it's FULLY done
+  - If you hit errors, blockers, or can't finish, leave it `in_progress`
+  - When blocked, add a new task describing what must be resolved
+
+4. **Task Breakdown**:
+  - Create specific, actionable items
+  - Break complex tasks into smaller, manageable steps
+  - Use clear, descriptive task names
+
+When unsure, use this tool. Proactive task management shows attentiveness and helps ensure all requirements are met.
+""".strip()
+
+
 BACKEND_TOOLS = {
     "get_weather": {
         "description": "Get the current weather for a city",
@@ -85,6 +193,29 @@ BACKEND_TOOLS = {
             "required": ["expression"]
         },
         "handler": lambda expression: str(eval(expression))
+    },
+    "todo_write": {
+        "description": TODO_WRITE_PROMPT,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "The updated todo list",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "Unique identifier for the todo"},
+                            "content": {"type": "string", "description": "Description of the task"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Current status of the task"}
+                        },
+                        "required": ["id", "content", "status"]
+                    }
+                }
+            },
+            "required": ["todos"]
+        },
+        "handler": lambda todos: "To-dos updated successfully. Continue with any active tasks."
     }
 }
 

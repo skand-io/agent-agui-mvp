@@ -3,3 +3,4 @@ export { Message } from './Message';
 export { InputArea } from './InputArea';
 export { Loading } from './Loading';
 export { DefaultActions } from './DefaultActions';
+export { TodoList } from './TodoList';

@@ -1,4 +1,5 @@
-import { Message as MessageType } from '../types';
+import { Message as MessageType, TodoItem } from '../types';
+import { TodoList } from './TodoList';
 import styles from './Message.module.css';
 
 interface MessageProps {
@@ -6,6 +7,19 @@ interface MessageProps {
 }
 
 export function Message({ message }: MessageProps) {
+  // Check for todo_write tool calls to render inline
+  const todoToolCall = message.toolCalls?.find(tc => tc.name === 'todo_write');
+  let todos: TodoItem[] | null = null;
+
+  if (todoToolCall) {
+    try {
+      const args = JSON.parse(todoToolCall.arguments);
+      todos = args.todos;
+    } catch {
+      // Ignore parse errors
+    }
+  }
+
   const getClassName = () => {
     const classes = [styles.message, styles[message.role]];
     if (message.isFrontend) classes.push(styles.frontend);
@@ -22,6 +36,9 @@ export function Message({ message }: MessageProps) {
 
   return (
     <div className={getClassName()} data-testid={getTestId()}>
+      {/* Render todo list if present */}
+      {todos && <TodoList todos={todos} />}
+      {/* Render message content */}
       {message.content}
     </div>
   );

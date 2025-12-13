@@ -1,0 +1,85 @@
+.todoList {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin: 8px 0;
+  background: #f8fafc;
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  background: #f1f5f9;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.title {
+  font-weight: 600;
+  color: #334155;
+}
+
+.progress {
+  font-size: 0.85em;
+  color: #64748b;
+}
+
+.items {
+  padding: 8px 14px;
+}
+
+.item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 0;
+}
+
+.checkbox {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  font-size: 14px;
+}
+
+.content {
+  flex: 1;
+  line-height: 1.4;
+}
+
+.pending {
+  color: #64748b;
+}
+
+.pending .checkbox {
+  color: #94a3b8;
+}
+
+.in_progress {
+  color: #0369a1;
+  font-weight: 500;
+}
+
+.in_progress .checkbox {
+  color: #0ea5e9;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.completed {
+  color: #16a34a;
+}
+
+.completed .content {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.completed .checkbox {
+  color: #22c55e;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
