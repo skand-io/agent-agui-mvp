@@ -9,7 +9,12 @@ const MAX_FOLLOW_UP_DEPTH = 5;
 
 // Type for the LLM request payload
 export interface LLMPayload {
-  messages: Array<{ role: string; content: string }>;
+  messages: Array<{
+    role: string;
+    content: string;
+    toolCalls?: Array<{ id: string; name: string; arguments: string }>;
+    toolCallId?: string;
+  }>;
   frontendTools: Array<{ name: string; description: string; parameters: unknown }>;
   threadId: string;
   runId: string;
@@ -42,11 +47,16 @@ export function useChatWithContext() {
     // Get readable context to send to LLM
     const contextString = getContextStringRef.current();
 
-    // Build the payload
+    // Build the payload - include toolCalls and toolCallId for proper OpenAI API threading
     const payload: LLMPayload = {
       messages: currentMessages.filter(
         (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'tool'
-      ).map((m) => ({ role: m.role, content: m.content })),
+      ).map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.toolCalls && m.toolCalls.length > 0 && { toolCalls: m.toolCalls }),
+        ...(m.toolCallId && { toolCallId: m.toolCallId }),
+      })),
       frontendTools: getToolsForBackendFromActions(actionsRef.current),
       threadId: threadIdRef.current,
       runId: crypto.randomUUID(),
@@ -205,6 +215,75 @@ function getToolsForBackendFromActions(actions: Map<string, CopilotAction>) {
   return [...tools, ...staticTools];
 }
 
+// Helper function to attach a tool call to the last assistant message
+// This is required for OpenAI API compatibility - tool results must have matching assistant tool_calls
+function attachToolCallToAssistant(
+  messages: Message[],
+  toolCallId: string,
+  toolCallName: string,
+  toolCallArguments: string,
+  lastAssistantMessageId: string | null
+): Message[] {
+  const updated = [...messages];
+  let targetIdx = -1;
+
+  // Find the assistant message by lastAssistantMessageId (from this run)
+  if (lastAssistantMessageId) {
+    for (let i = updated.length - 1; i >= 0; i--) {
+      if (updated[i].role === 'assistant' && updated[i].id === lastAssistantMessageId) {
+        targetIdx = i;
+        break;
+      }
+    }
+  }
+
+  // If no matching ID found, find the last assistant message
+  if (targetIdx < 0) {
+    for (let i = updated.length - 1; i >= 0; i--) {
+      if (updated[i].role === 'assistant') {
+        targetIdx = i;
+        break;
+      }
+    }
+  }
+
+  // If still no assistant message, create one
+  if (targetIdx < 0) {
+    const newMessage: Message = {
+      role: 'assistant',
+      content: '',
+      id: `tool-assistant-${toolCallId}`,
+      toolCalls: [{
+        id: toolCallId,
+        name: toolCallName,
+        arguments: toolCallArguments,
+      }],
+    };
+    return [...updated, newMessage];
+  }
+
+  // Check if this toolCall is already attached (prevent duplicates)
+  const existingToolCalls = updated[targetIdx].toolCalls || [];
+  const alreadyAttached = existingToolCalls.some(tc => tc.id === toolCallId);
+
+  if (!alreadyAttached) {
+    // Immutably update the message with tool calls
+    updated[targetIdx] = {
+      ...updated[targetIdx],
+      toolCalls: [
+        ...existingToolCalls,
+        {
+          id: toolCallId,
+          name: toolCallName,
+          arguments: toolCallArguments,
+        },
+      ],
+    };
+  }
+
+  return updated;
+}
+
 // Handle event with context actions and return tool execution info
 async function handleEventWithContext(
   event: AGUIEvent,
@@ -287,47 +366,17 @@ async function handleEventWithContext(
       if (!event.toolCallId) break;
       const toolCall = toolCalls[event.toolCallId];
 
-      // For todo_write, attach to the current assistant message for UI rendering
+      // For todo_write, attach to the assistant message for UI rendering
+      // Backend will handle the TOOL_CALL_RESULT
       if (toolCall.name === 'todo_write') {
-        const updated = [...currentMessages];
-        // Find the assistant message by lastAssistantMessageId (from this run)
-        let targetIdx = -1;
-        if (lastAssistantMessageId) {
-          for (let i = updated.length - 1; i >= 0; i--) {
-            if (updated[i].role === 'assistant' && updated[i].id === lastAssistantMessageId) {
-              targetIdx = i;
-              break;
-            }
-          }
-        }
-        // If no matching ID, create a new assistant message for the todo
-        if (targetIdx < 0) {
-          const newMessage: Message = {
-            role: 'assistant',
-            content: '',
-            id: `todo-${event.toolCallId}`,
-            toolCalls: [{
-              id: event.toolCallId,
-              name: toolCall.name,
-              arguments: toolCall.arguments,
-            }],
-          };
-          setMessages([...updated, newMessage]);
-        } else {
-          // Immutably update the message with tool calls
-          updated[targetIdx] = {
-            ...updated[targetIdx],
-            toolCalls: [
-              ...(updated[targetIdx].toolCalls || []),
-              {
-                id: event.toolCallId,
-                name: toolCall.name,
-                arguments: toolCall.arguments,
-              },
-            ],
-          };
-          setMessages(updated);
-        }
+        const updatedWithToolCall = attachToolCallToAssistant(
+          currentMessages,
+          event.toolCallId,
+          toolCall.name,
+          toolCall.arguments,
+          lastAssistantMessageId
+        );
+        setMessages(updatedWithToolCall);
         // Don't return - let the backend handle the TOOL_CALL_RESULT
         break;
       }
@@ -340,47 +389,87 @@ async function handleEventWithContext(
         try {
           const args = JSON.parse(toolCall.arguments || '{}');
           const result = await Promise.resolve(contextAction.handler(args));
+
+          // First attach the toolCall to the assistant message (OpenAI API requirement)
+          const updatedWithToolCall = attachToolCallToAssistant(
+            currentMessages,
+            event.toolCallId,
+            toolCall.name,
+            toolCall.arguments,
+            lastAssistantMessageId
+          );
+
+          // Then add the tool result message
           const toolMessage: Message = {
             role: 'tool',
             content: `Frontend tool "${toolCall.name}" executed: ${result}`,
             isFrontend: true,
             toolCallId: event.toolCallId,
           };
-          setMessages([...currentMessages, toolMessage]);
+          setMessages([...updatedWithToolCall, toolMessage]);
           return { frontendToolExecuted: true, backendToolExecuted: false, action: contextAction, result };
         } catch (e) {
           const errorMsg = e instanceof Error ? e.message : 'Unknown error';
           console.error('Frontend tool error:', e);
+
+          // Still attach toolCall even on error
+          const updatedWithToolCall = attachToolCallToAssistant(
+            currentMessages,
+            event.toolCallId,
+            toolCall.name,
+            toolCall.arguments,
+            lastAssistantMessageId
+          );
+
           const errorMessage: Message = {
             role: 'tool',
             content: `Frontend tool "${toolCall.name}" error: ${errorMsg}`,
             isFrontend: true,
             toolCallId: event.toolCallId,
           };
-          setMessages([...currentMessages, errorMessage]);
+          setMessages([...updatedWithToolCall, errorMessage]);
         }
       } else if (staticTool) {
         try {
           const args = JSON.parse(toolCall.arguments || '{}');
           const result = staticTool.handler(args);
+
+          // First attach the toolCall to the assistant message
+          const updatedWithToolCall = attachToolCallToAssistant(
+            currentMessages,
+            event.toolCallId,
+            toolCall.name,
+            toolCall.arguments,
+            lastAssistantMessageId
+          );
+
           const toolMessage: Message = {
             role: 'tool',
             content: `Frontend tool "${toolCall.name}" executed: ${result}`,
             isFrontend: true,
             toolCallId: event.toolCallId,
           };
-          setMessages([...currentMessages, toolMessage]);
+          setMessages([...updatedWithToolCall, toolMessage]);
           // Static tools don't trigger follow-up
         } catch (e) {
           const errorMsg = e instanceof Error ? e.message : 'Unknown error';
           console.error('Frontend tool error:', e);
+
+          const updatedWithToolCall = attachToolCallToAssistant(
+            currentMessages,
+            event.toolCallId,
+            toolCall.name,
+            toolCall.arguments,
+            lastAssistantMessageId
+          );
+
           const errorMessage: Message = {
             role: 'tool',
             content: `Frontend tool "${toolCall.name}" error: ${errorMsg}`,
             isFrontend: true,
             toolCallId: event.toolCallId,
           };
-          setMessages([...currentMessages, errorMessage]);
+          setMessages([...updatedWithToolCall, errorMessage]);
         }
       }
       break;
@@ -389,24 +478,39 @@ async function handleEventWithContext(
     case EventType.TOOL_CALL_RESULT: {
       console.log('[AG-UI] Backend tool result:', event.content);
 
-      // Look up the tool name from the toolCallId
-      const toolName = event.toolCallId ? toolCalls[event.toolCallId]?.name : null;
-
-      // todo_write is UI-only, don't trigger follow-up
+      // Look up the tool from the toolCallId
+      const toolCall = event.toolCallId ? toolCalls[event.toolCallId] : null;
+      const toolName = toolCall?.name || null;
       const isTodoWrite = toolName === 'todo_write';
 
-      if (!isTodoWrite) {
-        const toolResultMessage: Message = {
-          role: 'tool',
-          content: event.content || '',
-          isFrontend: false,
-          isBackend: true,
-          toolCallId: event.toolCallId,
-        };
-        setMessages([...currentMessages, toolResultMessage]);
+      // First, attach the toolCall to the assistant message (OpenAI API requirement)
+      // The helper function prevents duplicates if already attached in TOOL_CALL_END
+      let updatedMessages = currentMessages;
+      if (event.toolCallId && toolCall) {
+        updatedMessages = attachToolCallToAssistant(
+          currentMessages,
+          event.toolCallId,
+          toolCall.name,
+          toolCall.arguments,
+          lastAssistantMessageId
+        );
       }
 
-      return { frontendToolExecuted: false, backendToolExecuted: !isTodoWrite };
+      // For todo_write, add a message that instructs LLM to continue with tasks
+      // For other tools, add the actual result
+      const toolResultMessage: Message = {
+        role: 'tool',
+        content: isTodoWrite
+          ? 'Todo list created. Now execute the tasks in the list one by one. Do NOT call todo_write again until you have completed at least one task.'
+          : (event.content || ''),
+        isFrontend: false,
+        isBackend: true,
+        toolCallId: event.toolCallId,
+      };
+      setMessages([...updatedMessages, toolResultMessage]);
+
+      // Always trigger follow-up for backend tools so LLM can continue
+      return { frontendToolExecuted: false, backendToolExecuted: true };
     }
 
     case EventType.RUN_FINISHED:
