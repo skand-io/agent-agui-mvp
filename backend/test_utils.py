@@ -6,10 +6,14 @@ import time
 import sys
 import json
 import httpx
+from pathlib import Path
 from typing import Optional
 
 SERVER_URL = "http://localhost:8000"
 SERVER_PROCESS: Optional[subprocess.Popen] = None
+
+# Get the directory where this file is located (backend folder)
+BACKEND_DIR = Path(__file__).parent.absolute()
 
 
 def start_server():
@@ -18,7 +22,7 @@ def start_server():
     print("Starting server...")
     SERVER_PROCESS = subprocess.Popen(
         [sys.executable, "server.py"],
-        cwd="/Users/kevinlu/Downloads/minimal-chat",
+        cwd=str(BACKEND_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE
     )

@@ -10,6 +10,7 @@ AG-UI Protocol Events:
 import os
 import json
 import uuid
+from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -44,8 +45,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file in parent directory
+env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # OpenRouter client
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")

@@ -1,0 +1,14 @@
+{
+  "name": "ag-ui-frontend",
+  "version": "1.0.0",
+  "description": "AG-UI Frontend Demo with Playwright E2E tests",
+  "scripts": {
+    "serve": "npx serve -l 3000 .",
+    "test": "npx playwright test",
+    "test:headed": "npx playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.0",
+    "serve": "^14.2.0"
+  }
+}
