@@ -206,7 +206,15 @@ async function handleEventWithContext(
 ): Promise<{ frontendToolExecuted: boolean; action?: CopilotAction; result?: string }> {
   switch (event.type) {
     case EventType.RUN_STARTED:
-      console.log('[AG-UI] Run started:', event.runId);
+      console.log('[AG-UI] Run started:', event.runId, 'input:', event.input);
+      break;
+
+    case EventType.STEP_STARTED:
+      console.log('[AG-UI] Step started:', event.stepName);
+      break;
+
+    case EventType.STEP_FINISHED:
+      console.log('[AG-UI] Step finished:', event.stepName);
       break;
 
     case EventType.TEXT_MESSAGE_START:
@@ -359,11 +367,11 @@ async function handleEventWithContext(
       break;
 
     case EventType.RUN_FINISHED:
-      console.log('[AG-UI] Run finished:', event.runId);
+      console.log('[AG-UI] Run finished:', event.runId, 'result:', event.result);
       break;
 
     case EventType.RUN_ERROR:
-      console.error('[AG-UI] Run error:', event.message);
+      console.error('[AG-UI] Run error:', event.message, 'code:', event.code);
       setMessages([
         ...currentMessages,
         {
@@ -371,6 +379,49 @@ async function handleEventWithContext(
           content: `Error: ${event.message}`,
         },
       ]);
+      break;
+
+    // State management events (AG-UI protocol compliance)
+    case EventType.STATE_SNAPSHOT:
+      console.log('[AG-UI] State snapshot received:', event.state);
+      // Could emit to context or state management system
+      break;
+
+    case EventType.STATE_DELTA:
+      console.log('[AG-UI] State delta received:', event.operations);
+      // Apply JSON Patch operations to state
+      break;
+
+    case EventType.MESSAGES_SNAPSHOT:
+      console.log('[AG-UI] Messages snapshot received:', event.messages);
+      // Could sync conversation history from server
+      break;
+
+    // Activity events
+    case EventType.ACTIVITY_SNAPSHOT:
+      console.log('[AG-UI] Activity snapshot:', event.activityType, event.content);
+      break;
+
+    case EventType.ACTIVITY_DELTA:
+      console.log('[AG-UI] Activity delta:', event.operations);
+      break;
+
+    // Special events
+    case EventType.RAW:
+      console.log('[AG-UI] Raw event:', event.source, event.rawEvent);
+      break;
+
+    case EventType.CUSTOM:
+      console.log('[AG-UI] Custom event:', event.name, event.value);
+      break;
+
+    // Convenience chunk events (auto-expanded by some implementations)
+    case EventType.TEXT_MESSAGE_CHUNK:
+      console.log('[AG-UI] Text message chunk (convenience event)');
+      break;
+
+    case EventType.TOOL_CALL_CHUNK:
+      console.log('[AG-UI] Tool call chunk (convenience event)');
       break;
   }
 

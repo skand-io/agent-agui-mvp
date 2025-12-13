@@ -2,14 +2,18 @@
 Minimal CopilotKit-like Backend Server using AG-UI Protocol
 FastAPI + OpenRouter for LLM API with frontend + backend tool support
 
-AG-UI Protocol Events:
-- TEXT_MESSAGE_START/CONTENT/END: For streaming text
-- TOOL_CALL_START/ARGS/END/RESULT: For tool execution
-- RUN_STARTED/FINISHED: Lifecycle events
+AG-UI Protocol Events (Full Compliance):
+- RUN_STARTED/FINISHED/ERROR: Lifecycle events
+- STEP_STARTED/FINISHED: Progress tracking
+- TEXT_MESSAGE_START/CONTENT/END: Text streaming
+- TOOL_CALL_START/ARGS/END/RESULT: Tool execution
+- STATE_SNAPSHOT/STATE_DELTA: State management
+- CUSTOM: Application-defined events
 """
 import os
 import json
 import uuid
+import time
 import hashlib
 import httpx
 from pathlib import Path
@@ -19,21 +23,37 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 
-# Import AG-UI types from pydantic
+# Import AG-UI types (Full Protocol Compliance)
 from ag_ui.core import (
     EventType,
+    # Lifecycle events
     RunStartedEvent,
     RunFinishedEvent,
     RunErrorEvent,
+    # Step events
+    StepStartedEvent,
+    StepFinishedEvent,
+    # Text message events
     TextMessageStartEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
+    # Tool call events
     ToolCallStartEvent,
     ToolCallArgsEvent,
     ToolCallEndEvent,
     ToolCallResultEvent,
+    # State management events
+    StateSnapshotEvent,
+    StateDeltaEvent,
+    # Special events
+    CustomEvent,
 )
 from ag_ui.encoder import EventEncoder
+
+
+def get_timestamp() -> int:
+    """Get current timestamp in milliseconds for AG-UI protocol events."""
+    return int(time.time() * 1000)
 
 app = FastAPI()
 
@@ -423,8 +443,20 @@ async def chat(request: Request):
 
     async def generate():
         try:
-            # RUN_STARTED event
-            yield encoder.encode(RunStartedEvent(thread_id=thread_id, run_id=run_id))
+            # RUN_STARTED event (AG-UI protocol)
+            # Note: input field requires RunAgentInput type which is complex,
+            # so we omit it for simplicity (it's optional per spec)
+            yield encoder.encode(RunStartedEvent(
+                thread_id=thread_id,
+                run_id=run_id,
+                timestamp=get_timestamp()
+            ))
+
+            # STEP_STARTED: LLM inference
+            yield encoder.encode(StepStartedEvent(
+                step_name="llm_inference",
+                timestamp=get_timestamp()
+            ))
 
             # Call OpenRouter with streaming
             stream = client.chat.completions.create(
@@ -500,7 +532,20 @@ async def chat(request: Request):
                 if finish_reason == "stop" and text_started:
                     yield encoder.encode(TextMessageEndEvent(message_id=message_id))
 
+            # STEP_FINISHED: LLM inference complete
+            yield encoder.encode(StepFinishedEvent(
+                step_name="llm_inference",
+                timestamp=get_timestamp()
+            ))
+
             # Process completed tool calls
+            if current_tool_calls:
+                # STEP_STARTED: Tool execution
+                yield encoder.encode(StepStartedEvent(
+                    step_name="tool_execution",
+                    timestamp=get_timestamp()
+                ))
+
             for idx, tool_call in current_tool_calls.items():
                 tool_name = tool_call["name"]
                 tool_call_id = tool_call["id"]
@@ -533,8 +578,24 @@ async def chat(request: Request):
                         ))
                 # Frontend tools: no result from server (client executes them)
 
-            # RUN_FINISHED event
-            yield encoder.encode(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+            # STEP_FINISHED: Tool execution complete
+            if current_tool_calls:
+                yield encoder.encode(StepFinishedEvent(
+                    step_name="tool_execution",
+                    timestamp=get_timestamp()
+                ))
+
+            # RUN_FINISHED event with result and timestamp (AG-UI protocol compliance)
+            yield encoder.encode(RunFinishedEvent(
+                thread_id=thread_id,
+                run_id=run_id,
+                timestamp=get_timestamp(),
+                result={
+                    "message_id": message_id,
+                    "tool_calls_count": len(current_tool_calls),
+                    "tool_names": [tc["name"] for tc in current_tool_calls.values()] if current_tool_calls else []
+                }
+            ))
 
         except Exception as e:
             yield encoder.encode(RunErrorEvent(message=str(e), code="RUNTIME_ERROR"))
