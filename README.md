@@ -39,61 +39,132 @@ agent-agui-mvp/
 
 ### Prerequisites
 
-- Python 3.11+
-- Node.js 20+
-- [uv](https://github.com/astral-sh/uv) (Python package manager)
+- **Python 3.11+**
+- **Node.js 20+**
+- **[uv](https://github.com/astral-sh/uv)** - Fast Python package manager
+  ```bash
+  # Install uv (macOS/Linux)
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
 
-### Setup
+### Step 1: Clone and Setup Environment
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/rawmarshmellows/agent-agui-mvp.git
-   cd agent-agui-mvp
-   ```
-
-2. **Create environment file**
-   ```bash
-   cat > .env << EOF
-   OPENROUTER_API_KEY=your-api-key-here
-   MODEL=amazon/nova-2-lite-v1:free
-   EOF
-   ```
-
-3. **Install backend dependencies**
-   ```bash
-   uv sync
-   ```
-
-4. **Install frontend dependencies**
-   ```bash
-   cd frontend && npm install
-   ```
-
-### Running the Application
-
-1. **Start the backend server**
-   ```bash
-   cd backend && uv run python server.py
-   ```
-
-2. **Start the frontend dev server** (in another terminal)
-   ```bash
-   cd frontend && npm run dev
-   ```
-
-3. Open http://localhost:3000 in your browser
-
-### Running Tests
-
-**Backend tests:**
 ```bash
-cd backend && uv run python test_e2e.py
+# Clone the repository
+git clone https://github.com/rawmarshmellows/agent-agui-mvp.git
+cd agent-agui-mvp
+
+# Create the .env file with your OpenRouter API key
+cat > .env << 'EOF'
+OPENROUTER_API_KEY=your-openrouter-api-key-here
+MODEL=amazon/nova-2-lite-v1:free
+EOF
 ```
 
-**Frontend Playwright tests:**
+> **Note**: Get your OpenRouter API key from [openrouter.ai](https://openrouter.ai)
+
+### Step 2: Install Dependencies
+
 ```bash
-cd frontend && npx playwright install && npm test
+# Install Python backend dependencies
+uv sync
+
+# Install Node.js frontend dependencies
+cd frontend
+npm install
+cd ..
 ```
+
+### Step 3: Run the Application
+
+You need **two terminal windows** to run both servers:
+
+**Terminal 1 - Start the Backend (FastAPI server on port 8000):**
+```bash
+cd backend
+uv run python server.py
+```
+
+You should see:
+```
+INFO:     Uvicorn running on http://0.0.0.0:8000
+```
+
+**Terminal 2 - Start the Frontend (Vite dev server on port 3000):**
+```bash
+cd frontend
+npm run dev
+```
+
+You should see:
+```
+VITE v5.x.x  ready in xxx ms
+➜  Local:   http://localhost:3000/
+```
+
+### Step 4: Use the Chat Interface
+
+1. Open your browser to **http://localhost:3000**
+2. Try these example prompts:
+
+| Prompt | What Happens |
+|--------|--------------|
+| `Greet Alice` | Frontend tool - shows an alert in your browser |
+| `Change the theme to lightblue` | Frontend tool - changes background color |
+| `What's the weather in Tokyo?` | Backend tool - returns mock weather data |
+| `Calculate 15 * 7` | Backend tool - evaluates math expression |
+
+---
+
+## Running Tests
+
+### Backend API Tests
+
+These tests verify the AG-UI protocol implementation and tool execution at the API level.
+
+```bash
+cd backend
+
+# Run all backend tests
+uv run python test_e2e.py
+
+# Run only backend tool tests (get_weather, calculate)
+uv run python test_backend_tools.py
+
+# Run only frontend tool tests at API level (greet, setTheme)
+uv run python test_frontend_tools.py
+```
+
+### Frontend E2E Tests (Playwright)
+
+These tests run a real browser and verify the complete user flow.
+
+**First-time setup - Install Playwright browsers:**
+```bash
+cd frontend
+npx playwright install
+```
+
+**Run the tests:**
+```bash
+cd frontend
+
+# Run tests in headless mode (CI-style)
+npm test
+
+# Run tests with browser visible (useful for debugging)
+npm run test:headed
+```
+
+> **Note**: Playwright tests automatically start both the frontend and backend servers, so you don't need to start them manually.
+
+**View test report:**
+After running tests, open the HTML report:
+```bash
+npx playwright show-report
+```
+
+---
 
 ## AG-UI Protocol Events
 
@@ -125,21 +196,40 @@ Execute on the server and return results via `TOOL_CALL_RESULT`.
 - **get_weather**: Returns weather information for a city
 - **calculate**: Evaluates mathematical expressions
 
-## Example Prompts
+---
 
-Try these in the chat:
-- "Greet Alice" - Triggers the frontend `greet` tool
-- "Change the theme to lightblue" - Triggers the frontend `setTheme` tool
-- "What's the weather in Tokyo?" - Triggers the backend `get_weather` tool
-- "Calculate 15 * 7" - Triggers the backend `calculate` tool
+## GitHub Actions CI
 
-## GitHub Actions
-
-The repository includes a CI workflow that runs on push/PR to main:
+The repository includes a CI workflow (`.github/workflows/test.yml`) that runs on push/PR to main:
 - Backend Python tests
 - Frontend Playwright e2e tests
 
-To enable CI, add `OPENROUTER_API_KEY` as a repository secret.
+**To enable CI in your fork:**
+1. Go to your repository Settings → Secrets and variables → Actions
+2. Add a new secret: `OPENROUTER_API_KEY` with your API key value
+
+---
+
+## Troubleshooting
+
+### Backend won't start
+- Make sure you have Python 3.11+ installed: `python --version`
+- Ensure `.env` file exists in the root directory with valid `OPENROUTER_API_KEY`
+- Check if port 8000 is already in use: `lsof -i :8000`
+
+### Frontend won't start
+- Make sure you have Node.js 20+ installed: `node --version`
+- Run `npm install` in the frontend directory
+- Check if port 3000 is already in use: `lsof -i :3000`
+
+### Tests fail with "Connection error"
+- Ensure your `OPENROUTER_API_KEY` is valid
+- Check your internet connection
+- The free model may have rate limits - wait a few seconds between tests
+
+### Playwright tests fail
+- Make sure you've installed browsers: `npx playwright install`
+- Try running with `npm run test:headed` to see what's happening
 
 ## License
 
