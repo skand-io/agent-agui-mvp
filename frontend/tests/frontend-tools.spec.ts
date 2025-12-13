@@ -84,11 +84,12 @@ test.describe('AG-UI Frontend Tool Calls', () => {
     const sendButton = page.getByTestId('send-button');
     await sendButton.click();
 
-    // The button should be disabled during loading
-    await expect(sendButton).toBeDisabled();
+    // The input should be disabled during loading
+    await expect(input).toBeDisabled();
 
-    // Wait for the response to complete
-    await expect(sendButton).toBeEnabled({ timeout: 60000 });
+    // Wait for the response to complete - input becomes enabled again
+    // (button stays disabled because input is empty after sending)
+    await expect(input).toBeEnabled({ timeout: 60000 });
   });
 
   test('should stream text messages in real-time', async ({ page }) => {
@@ -126,21 +127,24 @@ test.describe('AG-UI Frontend Tool Calls', () => {
     await expect(firstToolMessage).toBeVisible({ timeout: 60000 });
     await expect(firstToolMessage).toContainText('greet');
 
-    // Wait for the send button to be enabled again
-    await expect(sendButton).toBeEnabled({ timeout: 60000 });
+    // Wait for the input to be enabled again (loading complete)
+    await expect(input).toBeEnabled({ timeout: 60000 });
 
     // Now trigger setTheme tool
     await input.fill('Change theme to pink using setTheme.');
     await sendButton.click();
 
-    // Wait for second tool execution
-    // There should now be multiple tool messages
-    const toolMessages = page.getByTestId('message-tool-frontend');
-    await expect(toolMessages).toHaveCount(2, { timeout: 60000 });
+    // Wait for a setTheme tool message to appear
+    // (LLM may call additional tools, so we check for at least one setTheme message)
+    const setThemeMessage = page.locator('[data-testid="message-tool-frontend"]', {
+      hasText: 'setTheme',
+    });
+    await expect(setThemeMessage.first()).toBeVisible({ timeout: 60000 });
 
-    // Second message should be about setTheme
-    const secondToolMessage = toolMessages.nth(1);
-    await expect(secondToolMessage).toContainText('setTheme');
+    // Verify we have at least 2 frontend tool messages total
+    const toolMessages = page.getByTestId('message-tool-frontend');
+    const count = await toolMessages.count();
+    expect(count).toBeGreaterThanOrEqual(2);
   });
 
   test('should display user messages correctly', async ({ page }) => {
