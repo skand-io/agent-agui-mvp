@@ -3,9 +3,9 @@ import { test, expect } from '@playwright/test';
 test.describe('AG-UI Frontend Tool Calls', () => {
   test.beforeEach(async ({ page }) => {
     // Navigate to the frontend
-    await page.goto('/index.html');
+    await page.goto('/');
     // Wait for the page to fully load
-    await expect(page.locator('.chat-container')).toBeVisible();
+    await expect(page.getByTestId('chat-container')).toBeVisible();
   });
 
   test('should execute greet frontend tool when prompted', async ({ page }) => {
@@ -18,17 +18,17 @@ test.describe('AG-UI Frontend Tool Calls', () => {
     });
 
     // Type a message that triggers the greet tool
-    const input = page.locator('input[placeholder*="Greet"]');
+    const input = page.getByTestId('message-input');
     await expect(input).toBeVisible();
     await input.fill('Please greet Alice using the greet tool.');
 
     // Click send button
-    const sendButton = page.locator('button:has-text("Send")');
+    const sendButton = page.getByTestId('send-button');
     await sendButton.click();
 
     // Wait for the response - the tool execution message should appear
-    // Frontend tool executions are shown with a specific class
-    const toolMessage = page.locator('.message.tool.frontend');
+    // Frontend tool executions are shown with a specific data-testid
+    const toolMessage = page.getByTestId('message-tool-frontend');
     await expect(toolMessage).toBeVisible({ timeout: 60000 });
 
     // Verify the tool was executed for the greet tool
@@ -38,9 +38,6 @@ test.describe('AG-UI Frontend Tool Calls', () => {
     // Verify the alert was shown (this confirms frontend execution)
     expect(alertMessage).toContain('Hello');
     expect(alertMessage).toContain('Alice');
-
-    // Console should log the frontend tool execution
-    // We can check this in CI by capturing console messages
   });
 
   test('should execute setTheme frontend tool when prompted', async ({ page }) => {
@@ -50,16 +47,16 @@ test.describe('AG-UI Frontend Tool Calls', () => {
     });
 
     // Type a message that triggers the setTheme tool
-    const input = page.locator('input[placeholder*="Greet"]');
+    const input = page.getByTestId('message-input');
     await expect(input).toBeVisible();
     await input.fill('Change the theme to lightblue using the setTheme tool.');
 
     // Click send button
-    const sendButton = page.locator('button:has-text("Send")');
+    const sendButton = page.getByTestId('send-button');
     await sendButton.click();
 
     // Wait for the tool execution message
-    const toolMessage = page.locator('.message.tool.frontend');
+    const toolMessage = page.getByTestId('message-tool-frontend');
     await expect(toolMessage).toBeVisible({ timeout: 60000 });
 
     // Verify the tool was executed for setTheme
@@ -80,11 +77,11 @@ test.describe('AG-UI Frontend Tool Calls', () => {
 
   test('should show loading state while waiting for response', async ({ page }) => {
     // Type a message
-    const input = page.locator('input[placeholder*="Greet"]');
+    const input = page.getByTestId('message-input');
     await input.fill('Hello');
 
     // Click send and immediately check for loading state
-    const sendButton = page.locator('button:has-text("Send")');
+    const sendButton = page.getByTestId('send-button');
     await sendButton.click();
 
     // The button should be disabled during loading
@@ -96,15 +93,15 @@ test.describe('AG-UI Frontend Tool Calls', () => {
 
   test('should stream text messages in real-time', async ({ page }) => {
     // Type a simple message that doesn't trigger tools
-    const input = page.locator('input[placeholder*="Greet"]');
+    const input = page.getByTestId('message-input');
     await input.fill('Say hello in exactly 3 words.');
 
     // Click send button
-    const sendButton = page.locator('button:has-text("Send")');
+    const sendButton = page.getByTestId('send-button');
     await sendButton.click();
 
     // Wait for an assistant message to appear
-    const assistantMessage = page.locator('.message.assistant');
+    const assistantMessage = page.getByTestId('message-assistant');
     await expect(assistantMessage.first()).toBeVisible({ timeout: 60000 });
 
     // The message should have content
@@ -118,14 +115,14 @@ test.describe('AG-UI Frontend Tool Calls', () => {
     });
 
     // First, trigger greet tool
-    const input = page.locator('input[placeholder*="Greet"]');
+    const input = page.getByTestId('message-input');
     await input.fill('Greet Bob using the greet tool.');
 
-    const sendButton = page.locator('button:has-text("Send")');
+    const sendButton = page.getByTestId('send-button');
     await sendButton.click();
 
     // Wait for first tool execution
-    const firstToolMessage = page.locator('.message.tool.frontend').first();
+    const firstToolMessage = page.getByTestId('message-tool-frontend').first();
     await expect(firstToolMessage).toBeVisible({ timeout: 60000 });
     await expect(firstToolMessage).toContainText('greet');
 
@@ -138,7 +135,7 @@ test.describe('AG-UI Frontend Tool Calls', () => {
 
     // Wait for second tool execution
     // There should now be multiple tool messages
-    const toolMessages = page.locator('.message.tool.frontend');
+    const toolMessages = page.getByTestId('message-tool-frontend');
     await expect(toolMessages).toHaveCount(2, { timeout: 60000 });
 
     // Second message should be about setTheme
@@ -147,23 +144,23 @@ test.describe('AG-UI Frontend Tool Calls', () => {
   });
 
   test('should display user messages correctly', async ({ page }) => {
-    const input = page.locator('input[placeholder*="Greet"]');
+    const input = page.getByTestId('message-input');
     const testMessage = 'This is a test message';
     await input.fill(testMessage);
 
-    const sendButton = page.locator('button:has-text("Send")');
+    const sendButton = page.getByTestId('send-button');
     await sendButton.click();
 
     // Check that the user message appears in the chat
-    const userMessage = page.locator('.message.user');
+    const userMessage = page.getByTestId('message-user');
     await expect(userMessage).toContainText(testMessage);
   });
 
   test('should clear input after sending message', async ({ page }) => {
-    const input = page.locator('input[placeholder*="Greet"]');
+    const input = page.getByTestId('message-input');
     await input.fill('Test message');
 
-    const sendButton = page.locator('button:has-text("Send")');
+    const sendButton = page.getByTestId('send-button');
     await sendButton.click();
 
     // Input should be cleared after sending

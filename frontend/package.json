@@ -1,14 +1,25 @@
 {
   "name": "ag-ui-frontend",
+  "private": true,
   "version": "1.0.0",
-  "description": "AG-UI Frontend Demo with Playwright E2E tests",
+  "type": "module",
   "scripts": {
-    "serve": "npx serve -l 3000 .",
-    "test": "npx playwright test",
-    "test:headed": "npx playwright test --headed"
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.40.0",
-    "serve": "^14.2.0"
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.10"
   }
 }

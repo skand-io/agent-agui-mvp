@@ -10,20 +10,35 @@ Minimal CopilotKit-like backend server implementing the AG-UI (Agent UI) protoco
 
 ```
 agent-agui-mvp/
-├── backend/           # Python FastAPI server
-│   ├── server.py      # Main FastAPI server with AG-UI protocol
-│   ├── test_utils.py  # Shared test utilities
-│   ├── test_e2e.py    # Combined e2e tests
-│   ├── test_backend_tools.py  # Backend tool tests
-│   └── test_frontend_tools.py # Frontend tool tests (API-level)
-├── frontend/          # Web frontend with Playwright tests
-│   ├── index.html     # React-based chat UI
-│   ├── package.json   # Node.js dependencies
-│   ├── playwright.config.ts  # Playwright configuration
-│   └── tests/         # Playwright e2e tests
-│       └── frontend-tools.spec.ts
-├── .env               # Environment variables (API keys)
-└── pyproject.toml     # Python dependencies (uv)
+├── backend/                    # Python FastAPI server
+│   ├── server.py               # Main FastAPI server with AG-UI protocol
+│   ├── test_utils.py           # Shared test utilities
+│   ├── test_e2e.py             # Combined e2e tests
+│   ├── test_backend_tools.py   # Backend tool tests
+│   └── test_frontend_tools.py  # Frontend tool tests (API-level)
+├── frontend/                   # React + Vite frontend
+│   ├── src/
+│   │   ├── components/         # React components
+│   │   │   ├── ChatContainer.tsx
+│   │   │   ├── Message.tsx
+│   │   │   ├── InputArea.tsx
+│   │   │   └── Loading.tsx
+│   │   ├── hooks/
+│   │   │   └── useChat.ts      # AG-UI protocol hook
+│   │   ├── types/
+│   │   │   └── index.ts        # TypeScript types
+│   │   ├── tools.ts            # Frontend tool definitions
+│   │   ├── App.tsx
+│   │   └── main.tsx
+│   ├── tests/
+│   │   └── frontend-tools.spec.ts  # Playwright e2e tests
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── playwright.config.ts
+├── .github/workflows/
+│   └── test.yml                # GitHub Actions CI
+├── .env                        # Environment variables (gitignored)
+└── pyproject.toml              # Python dependencies (uv)
 ```
 
 ## Commands
@@ -47,17 +62,20 @@ cd backend && uv run python test_backend_tools.py
 cd backend && uv run python test_frontend_tools.py
 ```
 
-### Frontend (Node.js/Playwright)
+### Frontend (React/Vite/Playwright)
 
 ```bash
 # Install dependencies
 cd frontend && npm install
 
+# Run dev server
+cd frontend && npm run dev
+
+# Build for production
+cd frontend && npm run build
+
 # Install Playwright browsers
 cd frontend && npx playwright install
-
-# Run frontend static server
-cd frontend && npm run serve
 
 # Run Playwright e2e tests
 cd frontend && npm test
@@ -79,8 +97,8 @@ cd frontend && npm run test:headed
 
 **Key Files**:
 - `backend/server.py`: FastAPI server with `/chat` endpoint, tool definitions, and SSE streaming
-- `backend/test_utils.py`: Shared test utilities (server lifecycle, SSE parsing)
-- `frontend/index.html`: React-based chat UI implementing AG-UI protocol client
+- `frontend/src/hooks/useChat.ts`: React hook for AG-UI protocol client
+- `frontend/src/tools.ts`: Frontend tool definitions and handlers
 - `frontend/tests/frontend-tools.spec.ts`: Playwright e2e tests for frontend tool execution
 
 ## Environment

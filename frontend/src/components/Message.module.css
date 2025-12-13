@@ -1,0 +1,37 @@
+.message {
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  max-width: 80%;
+}
+
+.user {
+  background: #2563eb;
+  color: white;
+  margin-left: auto;
+}
+
+.assistant {
+  background: #e5e7eb;
+  color: #1f2937;
+}
+
+.tool {
+  background: #fef3c7;
+  color: #92400e;
+  font-family: monospace;
+  font-size: 13px;
+  border-left: 3px solid #f59e0b;
+}
+
+.frontend {
+  background: #d1fae5;
+  color: #065f46;
+  border-left-color: #10b981;
+}
+
+.backend {
+  background: #dbeafe;
+  color: #1e40af;
+  border-left-color: #3b82f6;
+}
