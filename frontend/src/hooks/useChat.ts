@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from 'react';
 import { useCopilotContext } from '../context/CopilotContext';
 import { usePayloadContext } from '../context/PayloadContext';
 import { FRONTEND_TOOLS, getToolsForBackend } from '../tools';
-import { AGUIEvent, CopilotAction, EventType, Message, ToolCall } from '../types';
+import { AGUIEvent, CopilotAction, EventType, Message, TodoItem, ToolCall } from '../types';
 
 const API_URL = 'http://localhost:8000';
 const MAX_FOLLOW_UP_DEPTH = 5;
@@ -321,6 +321,60 @@ function attachOrUpdateTodoWrite(
   );
 }
 
+// Helper function to get the current todo list from messages
+// Used to attach todo state to tool result messages for visual re-rendering
+function getCurrentTodoList(messages: Message[]): TodoItem[] | undefined {
+  // Search backwards for the most recent todo_write tool call
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const todoCall = messages[i].toolCalls?.find(tc => tc.name === 'todo_write');
+    if (todoCall) {
+      try {
+        const parsed = JSON.parse(todoCall.arguments);
+        const todos = parsed.todos || parsed;
+        if (Array.isArray(todos)) {
+          return todos;
+        }
+      } catch {
+        // Ignore parse errors
+      }
+    }
+  }
+  return undefined;
+}
+
+// Helper function to get todo list with completed tasks based on tool execution count
+// Called when a tool finishes to show the user progressive completion
+function getTodoListWithCompletedTask(messages: Message[]): TodoItem[] | undefined {
+  const todos = getCurrentTodoList(messages);
+  if (!todos) return undefined;
+
+  // Count how many non-todo_write tool results exist in messages
+  // This tells us how many tasks have been completed
+  const completedToolCount = messages.filter(m =>
+    m.role === 'tool' &&
+    !m.content.includes('To-dos updated') && // Exclude todo_write results
+    !m.content.includes('Todo list') // Exclude todo_write results
+  ).length;
+
+  // Add 1 because this current tool (about to be added) is also completing
+  const tasksToMarkCompleted = completedToolCount + 1;
+
+  // Mark the first N items as completed (where N = tasksToMarkCompleted)
+  let markedCount = 0;
+  return todos.map(todo => {
+    // Skip already completed items
+    if (todo.status === 'completed') {
+      return todo;
+    }
+    // Mark pending/in_progress as completed until we've marked enough
+    if (markedCount < tasksToMarkCompleted) {
+      markedCount++;
+      return { ...todo, status: 'completed' as const };
+    }
+    return todo;
+  });
+}
+
 // Handle event with context actions and return tool execution info
 async function handleEventWithContext(
   event: AGUIEvent,
@@ -435,12 +489,13 @@ async function handleEventWithContext(
             lastAssistantMessageId
           );
 
-          // Then add the tool result message
+          // Then add the tool result message with auto-completed todo list
           const toolMessage: Message = {
             role: 'tool',
             content: `Frontend tool "${toolCall.name}" executed: ${result}`,
             isFrontend: true,
             toolCallId: event.toolCallId,
+            currentTodos: getTodoListWithCompletedTask(updatedWithToolCall),
           };
           setMessages([...updatedWithToolCall, toolMessage]);
           return { frontendToolExecuted: true, backendToolExecuted: false, action: contextAction, result };
@@ -479,11 +534,13 @@ async function handleEventWithContext(
             lastAssistantMessageId
           );
 
+          // Add tool result message with auto-completed todo list
           const toolMessage: Message = {
             role: 'tool',
             content: `Frontend tool "${toolCall.name}" executed: ${result}`,
             isFrontend: true,
             toolCallId: event.toolCallId,
+            currentTodos: getTodoListWithCompletedTask(updatedWithToolCall),
           };
           setMessages([...updatedWithToolCall, toolMessage]);
           // Static tools don't trigger follow-up
@@ -545,12 +602,16 @@ async function handleEventWithContext(
 
       // Add the tool result message - use actual backend response for all tools
       // The backend's smart handler provides context-aware responses for todo_write
+      // For non-todo_write tools, attach current todo list for visual re-rendering
       const toolResultMessage: Message = {
         role: 'tool',
         content: event.content || '',
         isFrontend: false,
         isBackend: true,
         toolCallId: event.toolCallId,
+        // Attach todo list with completed task so it renders underneath the tool result
+        // Use getTodoListWithCompletedTask to show the task as completed after tool finishes
+        currentTodos: isTodoWrite ? undefined : getTodoListWithCompletedTask(updatedMessages),
       };
       setMessages([...updatedMessages, toolResultMessage]);
 

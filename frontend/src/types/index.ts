@@ -45,6 +45,8 @@ export interface Message {
     name: string;
     arguments: string;
   }>;
+  // Current todo list state to render after tool results
+  currentTodos?: TodoItem[];
 }
 
 export interface TodoItem {

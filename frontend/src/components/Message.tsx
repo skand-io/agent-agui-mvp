@@ -36,10 +36,12 @@ export function Message({ message }: MessageProps) {
 
   return (
     <div className={getClassName()} data-testid={getTestId()}>
-      {/* Render todo list if present */}
+      {/* Render todo list from tool calls (e.g., todo_write) */}
       {todos && <TodoList todos={todos} />}
       {/* Render message content */}
       {message.content}
+      {/* Render current todo list after tool results for visual progress tracking */}
+      {message.currentTodos && <TodoList todos={message.currentTodos} />}
     </div>
   );
 }
