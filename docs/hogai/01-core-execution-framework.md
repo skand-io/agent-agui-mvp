@@ -4,13 +4,709 @@ This document provides comprehensive documentation of the PostHog HogAI core exe
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Class Hierarchy](#class-hierarchy)
-3. [Execution Pipeline](#execution-pipeline)
-4. [Node Path Context](#node-path-context)
-5. [Dispatcher Integration](#dispatcher-integration)
-6. [Graph Building API](#graph-building-api)
-7. [Complete Implementation Guide](#complete-implementation-guide)
+1. [Understanding LangChain & LangGraph](#understanding-langchain--langgraph)
+2. [What LangGraph Provides](#what-langgraph-provides)
+3. [What HogAI Adds on Top](#what-hogai-adds-on-top)
+4. [Building Without LangGraph](#building-without-langgraph)
+5. [Overview](#overview)
+6. [Class Hierarchy](#class-hierarchy)
+7. [Execution Pipeline](#execution-pipeline)
+8. [Node Path Context](#node-path-context)
+9. [Dispatcher Integration](#dispatcher-integration)
+10. [Graph Building API](#graph-building-api)
+11. [Complete Implementation Guide](#complete-implementation-guide)
+
+---
+
+## Understanding LangChain & LangGraph
+
+### What is LangChain?
+
+**LangChain** is a Python/JavaScript framework for building applications with Large Language Models (LLMs). Think of it as a toolkit that provides:
+
+1. **LLM Abstractions**: Unified interface to call different LLM providers (OpenAI, Anthropic, etc.)
+2. **Tool Calling**: Standard way to define "tools" that LLMs can invoke
+3. **Message Types**: Structured message formats (`HumanMessage`, `AIMessage`, `ToolMessage`)
+4. **Runnable Protocol**: A standard interface (`Runnable`) for composable components
+
+**Key LangChain concepts used in HogAI:**
+
+```python
+# LangChain message types
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+
+# LangChain tool base class
+from langchain_core.tools import BaseTool
+
+# LangChain configuration object (passed through execution)
+from langchain_core.runnables import RunnableConfig
+
+# LangChain LLM interface
+from langchain_openai import ChatOpenAI
+```
+
+### What is LangGraph?
+
+**LangGraph** is built on top of LangChain and adds **stateful, multi-step workflows** (called "graphs"). While LangChain handles single LLM calls, LangGraph handles:
+
+- **Multi-step agent loops** (LLM → Tool → LLM → Tool → ...)
+- **State persistence** (save/resume conversations)
+- **Conditional branching** (route to different nodes based on state)
+- **Parallel execution** (run multiple nodes simultaneously)
+- **Streaming** (emit events during execution)
+
+**Mental Model:**
+```
+LangChain = "How do I call an LLM and define tools?"
+LangGraph = "How do I orchestrate multiple LLM calls with branching, looping, and state?"
+```
+
+### The Graph Abstraction
+
+LangGraph models your agent as a **directed graph**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         LANGGRAPH                               │
+│                                                                 │
+│   ┌─────────┐                                                   │
+│   │  START  │ ← Entry point                                     │
+│   └────┬────┘                                                   │
+│        │                                                        │
+│        ↓                                                        │
+│   ┌─────────┐         ┌─────────────┐                           │
+│   │  ROOT   │ ──────→ │ ROOT_TOOLS  │ ← Nodes (your code)       │
+│   │  (LLM)  │ ←────── │  (execute)  │                           │
+│   └────┬────┘         └─────────────┘                           │
+│        │                                                        │
+│        ↓ (no more tools)                                        │
+│   ┌─────────┐                                                   │
+│   │   END   │ ← Exit point                                      │
+│   └─────────┘                                                   │
+│                                                                 │
+│   Edges define flow. Nodes are functions that transform state.  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key concepts:**
+- **Nodes**: Functions that receive state and return state updates
+- **Edges**: Connections between nodes (can be conditional)
+- **State**: A typed dictionary that flows through the graph
+- **Checkpointer**: Saves state for persistence/resumption
+
+---
+
+## What LangGraph Provides
+
+LangGraph gives you these capabilities "for free":
+
+### 1. State Management with Reducers
+
+```python
+from langgraph.graph import StateGraph
+from typing import Annotated
+
+# Define how fields merge when nodes return updates
+def add_messages(existing: list, new: list) -> list:
+    """Custom reducer: append new messages to existing."""
+    return existing + new
+
+class MyState(TypedDict):
+    # Annotated with a reducer function
+    messages: Annotated[list, add_messages]
+    count: int  # No reducer = replace on update
+
+# Create graph with state type
+graph = StateGraph(MyState)
+```
+
+**What this means:**
+- When a node returns `{"messages": [new_msg]}`, LangGraph automatically calls `add_messages(existing_messages, [new_msg])`
+- Without reducers, you'd need to manually merge state in every node
+
+### 2. Conditional Routing
+
+```python
+from langgraph.graph import END
+
+def route_based_on_state(state: MyState) -> str:
+    """Return the name of the next node."""
+    if state["messages"][-1].tool_calls:
+        return "tools_node"  # Go execute tools
+    return END  # Finish
+
+graph.add_conditional_edges(
+    "llm_node",           # From this node
+    route_based_on_state, # Call this function
+    {
+        "tools_node": "tools_node",
+        END: END,
+    }
+)
+```
+
+**What this means:**
+- After `llm_node` runs, LangGraph calls `route_based_on_state(state)`
+- Based on return value, it routes to the next node
+- Without this, you'd need to implement your own routing logic
+
+### 3. Parallel Execution with `Send`
+
+```python
+from langgraph.types import Send
+
+def route_to_parallel_tools(state: MyState) -> list[Send]:
+    """Execute multiple tools in parallel."""
+    tool_calls = state["messages"][-1].tool_calls
+    return [
+        Send("tools_node", {"tool_call_id": tc["id"]})
+        for tc in tool_calls
+    ]
+
+graph.add_conditional_edges("llm_node", route_to_parallel_tools)
+```
+
+**What this means:**
+- LangGraph will spawn multiple instances of `tools_node` running in parallel
+- Results are collected and merged back into state
+- Without this, you'd need to implement `asyncio.gather()` and state merging
+
+### 4. Checkpointing (Persistence)
+
+```python
+from langgraph.checkpoint.postgres import PostgresSaver
+
+checkpointer = PostgresSaver(connection_string)
+
+compiled_graph = graph.compile(checkpointer=checkpointer)
+
+# First run - saves state
+result = await compiled_graph.ainvoke(
+    {"messages": [HumanMessage("Hello")]},
+    config={"configurable": {"thread_id": "conversation-123"}}
+)
+
+# Later - resumes from saved state
+result = await compiled_graph.ainvoke(
+    {"messages": [HumanMessage("Follow up")]},
+    config={"configurable": {"thread_id": "conversation-123"}}
+)
+```
+
+**What this means:**
+- State is automatically saved after each node
+- Can resume conversations from any point
+- Supports interrupts (pause for user input)
+- Without this, you'd need to implement your own persistence layer
+
+### 5. Streaming Events
+
+```python
+async for event in compiled_graph.astream(
+    state,
+    config,
+    stream_mode=["values", "custom", "messages"]
+):
+    # "values" = state updates after each node
+    # "custom" = custom events from nodes (via StreamWriter)
+    # "messages" = LLM token-by-token streaming
+    print(event)
+```
+
+**What this means:**
+- Real-time updates as the graph executes
+- Multiple stream modes for different use cases
+- Without this, you'd need to implement your own event system
+
+### 6. Tool Binding
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+
+@tool
+def get_weather(city: str) -> str:
+    """Get weather for a city."""
+    return f"Weather in {city}: Sunny"
+
+llm = ChatOpenAI()
+llm_with_tools = llm.bind_tools([get_weather])
+
+# LLM can now generate tool calls
+response = await llm_with_tools.ainvoke([HumanMessage("What's the weather in NYC?")])
+# response.tool_calls = [{"name": "get_weather", "args": {"city": "NYC"}, "id": "..."}]
+```
+
+**What this means:**
+- LangChain handles converting your Python functions to JSON schemas
+- Handles parsing LLM responses into structured tool calls
+- Without this, you'd need to manually create schemas and parse responses
+
+---
+
+## What HogAI Adds on Top
+
+HogAI extends LangGraph with PostHog-specific features:
+
+### 1. Node Path Tracking
+
+**Problem:** In nested graphs (subgraphs calling subgraphs), you lose track of "where am I?"
+
+**HogAI Solution:**
+```python
+# Automatic path tracking through nested execution
+node_path = (
+    NodePath(name="MainGraph"),
+    NodePath(name="InsightsSubgraph"),
+    NodePath(name="TrendsGeneratorNode"),
+)
+
+# Every node knows its full path
+print(self.node_path)  # → Full traversal path
+```
+
+**Why this matters:**
+- Debugging: Know exactly where an error occurred
+- Streaming: Attribute events to correct node
+- Billing: Track which nodes triggered LLM calls
+
+### 2. Dispatcher for Real-Time UI Updates
+
+**Problem:** LangGraph's streaming is low-level. UI needs structured events.
+
+**HogAI Solution:**
+```python
+class MyNode(BaseAssistantNode):
+    async def arun(self, state, config):
+        # Emit UI update
+        self.dispatcher.update("Analyzing your data...")
+
+        # Do work
+        result = await self.analyze(state)
+
+        # Emit message for UI
+        self.dispatcher.message(AssistantMessage(content="Done!"))
+
+        return {"result": result}
+```
+
+**Why this matters:**
+- UI shows "Analyzing your data..." while node runs
+- Clean separation between node logic and event emission
+- Non-blocking: errors in dispatcher don't crash node
+
+### 3. Conversation Cancellation
+
+**Problem:** User clicks "Stop" - how do you halt execution?
+
+**HogAI Solution:**
+```python
+class BaseAssistantNode:
+    async def __call__(self, state, config):
+        # Check before execution
+        if await self._is_conversation_cancelled(thread_id):
+            raise GenerationCanceled
+
+        # Execute node
+        result = await self._execute(state, config)
+
+        return result
+```
+
+**Why this matters:**
+- Graceful cancellation without corrupting state
+- Database-backed status check (works across distributed workers)
+
+### 4. Mode System
+
+**Problem:** Different user intents need different tools and prompts.
+
+**HogAI Solution:**
+```python
+# Product Analytics mode
+class ProductAnalyticsToolkit:
+    tools = [CreateInsightTool, CreateDashboardTool]
+
+# SQL mode
+class SQLToolkit:
+    tools = [ExecuteSQLTool]
+
+# Dynamically switch based on user intent
+if user_wants_sql:
+    toolkit = SQLToolkit()
+```
+
+**Why this matters:**
+- Clean separation of concerns
+- LLM only sees relevant tools
+- Different system prompts per mode
+
+### 5. Django Integration
+
+**Problem:** Need to persist state, load user data, check permissions.
+
+**HogAI Solution:**
+```python
+class BaseAssistantNode:
+    def __init__(self, team: Team, user: User):
+        self._team = team  # Django model
+        self._user = user  # Django model
+
+    async def arun(self, state, config):
+        # Access Django models safely in async context
+        memory = await self._aget_core_memory()
+        return {"memory": memory}
+```
+
+**Why this matters:**
+- Async-safe Django ORM access
+- Team/user context available in every node
+- DjangoCheckpointer for state persistence
+
+---
+
+## Building Without LangGraph
+
+If you wanted to build HogAI **without LangGraph**, here's what you'd need to implement:
+
+### 1. Graph Execution Engine
+
+```python
+# WITHOUT LANGGRAPH - You'd need to build this:
+
+class GraphEngine:
+    def __init__(self):
+        self.nodes: dict[str, Callable] = {}
+        self.edges: dict[str, list[str]] = {}
+        self.conditional_edges: dict[str, tuple[Callable, dict]] = {}
+
+    def add_node(self, name: str, func: Callable):
+        self.nodes[name] = func
+
+    def add_edge(self, from_node: str, to_node: str):
+        self.edges.setdefault(from_node, []).append(to_node)
+
+    def add_conditional_edges(self, source: str, router: Callable, path_map: dict):
+        self.conditional_edges[source] = (router, path_map)
+
+    async def execute(self, initial_state: dict) -> dict:
+        state = initial_state
+        current_node = "START"
+
+        while current_node != "END":
+            # Get next node(s)
+            if current_node in self.conditional_edges:
+                router, path_map = self.conditional_edges[current_node]
+                next_key = router(state)
+                current_node = path_map[next_key]
+            elif current_node in self.edges:
+                current_node = self.edges[current_node][0]
+            else:
+                break
+
+            if current_node == "END":
+                break
+
+            # Execute node
+            node_func = self.nodes[current_node]
+            state_update = await node_func(state)
+
+            # Merge state (you'd need reducer logic here)
+            state = {**state, **state_update}
+
+        return state
+```
+
+**Complexity:** ~200 lines for basic version, ~2000+ for production-ready with error handling, parallel execution, interrupts.
+
+### 2. State Persistence (Checkpointing)
+
+```python
+# WITHOUT LANGGRAPH - You'd need to build this:
+
+class Checkpointer:
+    def __init__(self, db_connection):
+        self.db = db_connection
+
+    async def save(self, thread_id: str, state: dict, node_name: str):
+        """Save state after each node."""
+        await self.db.execute(
+            "INSERT INTO checkpoints (thread_id, state, node, timestamp) VALUES (?, ?, ?, ?)",
+            (thread_id, json.dumps(state), node_name, datetime.now())
+        )
+
+    async def load(self, thread_id: str) -> dict | None:
+        """Load latest state for thread."""
+        row = await self.db.fetchone(
+            "SELECT state FROM checkpoints WHERE thread_id = ? ORDER BY timestamp DESC LIMIT 1",
+            (thread_id,)
+        )
+        return json.loads(row["state"]) if row else None
+
+    async def get_history(self, thread_id: str) -> list[dict]:
+        """Get all checkpoints for thread."""
+        rows = await self.db.fetchall(
+            "SELECT * FROM checkpoints WHERE thread_id = ? ORDER BY timestamp",
+            (thread_id,)
+        )
+        return [json.loads(r["state"]) for r in rows]
+```
+
+**Complexity:** ~500 lines for basic, ~3000+ for production with namespaces, blob storage, migrations.
+
+### 3. State Reducers
+
+```python
+# WITHOUT LANGGRAPH - You'd need to build this:
+
+class StateManager:
+    def __init__(self, state_schema: type, reducers: dict[str, Callable]):
+        self.schema = state_schema
+        self.reducers = reducers
+
+    def merge(self, existing: dict, update: dict) -> dict:
+        """Merge state update into existing state."""
+        result = existing.copy()
+
+        for key, value in update.items():
+            if value is None:
+                continue
+
+            if key in self.reducers:
+                # Use custom reducer
+                reducer = self.reducers[key]
+                result[key] = reducer(existing.get(key), value)
+            else:
+                # Default: replace
+                result[key] = value
+
+        return result
+
+# Usage
+def add_messages(existing: list, new: list) -> list:
+    # Merge by ID, append new
+    existing_ids = {m["id"] for m in existing}
+    result = existing.copy()
+    for msg in new:
+        if msg["id"] in existing_ids:
+            # Update existing
+            for i, m in enumerate(result):
+                if m["id"] == msg["id"]:
+                    result[i] = msg
+                    break
+        else:
+            # Append new
+            result.append(msg)
+    return result
+
+state_manager = StateManager(
+    state_schema=AssistantState,
+    reducers={"messages": add_messages}
+)
+```
+
+**Complexity:** ~300 lines for basic, ~1000+ for production with validation, typing, edge cases.
+
+### 4. Streaming Infrastructure
+
+```python
+# WITHOUT LANGGRAPH - You'd need to build this:
+
+import asyncio
+from typing import AsyncGenerator
+
+class StreamManager:
+    def __init__(self):
+        self.subscribers: dict[str, list[asyncio.Queue]] = {}
+
+    def create_writer(self, thread_id: str) -> Callable:
+        """Create a writer function for a thread."""
+        def write(event: dict):
+            for queue in self.subscribers.get(thread_id, []):
+                queue.put_nowait(event)
+        return write
+
+    async def subscribe(self, thread_id: str) -> AsyncGenerator[dict, None]:
+        """Subscribe to events for a thread."""
+        queue = asyncio.Queue()
+        self.subscribers.setdefault(thread_id, []).append(queue)
+
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:  # End signal
+                    break
+                yield event
+        finally:
+            self.subscribers[thread_id].remove(queue)
+
+# In your graph engine
+class GraphEngineWithStreaming(GraphEngine):
+    def __init__(self, stream_manager: StreamManager):
+        super().__init__()
+        self.stream_manager = stream_manager
+
+    async def execute_with_streaming(
+        self,
+        initial_state: dict,
+        thread_id: str
+    ) -> AsyncGenerator[dict, None]:
+        writer = self.stream_manager.create_writer(thread_id)
+
+        # ... execute graph, calling writer(event) at each step
+
+        async for event in self.stream_manager.subscribe(thread_id):
+            yield event
+```
+
+**Complexity:** ~400 lines for basic, ~2000+ for production with backpressure, reconnection, multiple stream modes.
+
+### 5. Parallel Execution
+
+```python
+# WITHOUT LANGGRAPH - You'd need to build this:
+
+class ParallelExecutor:
+    async def execute_parallel(
+        self,
+        nodes: list[tuple[str, dict]],  # (node_name, node_state)
+        node_funcs: dict[str, Callable],
+    ) -> list[dict]:
+        """Execute multiple nodes in parallel and collect results."""
+
+        async def run_node(name: str, state: dict) -> dict:
+            func = node_funcs[name]
+            return await func(state)
+
+        tasks = [
+            run_node(name, state)
+            for name, state in nodes
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Handle exceptions
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                raise RuntimeError(f"Node {nodes[i][0]} failed: {result}")
+
+        return results
+
+    def merge_parallel_results(
+        self,
+        base_state: dict,
+        results: list[dict],
+        state_manager: StateManager,
+    ) -> dict:
+        """Merge results from parallel execution."""
+        merged = base_state.copy()
+        for result in results:
+            merged = state_manager.merge(merged, result)
+        return merged
+```
+
+**Complexity:** ~200 lines for basic, ~1500+ for production with cancellation, timeouts, error recovery.
+
+### 6. Tool Calling Infrastructure
+
+```python
+# WITHOUT LANGGRAPH (and LangChain) - You'd need to build this:
+
+import json
+from pydantic import BaseModel
+
+class ToolRegistry:
+    def __init__(self):
+        self.tools: dict[str, tuple[Callable, type[BaseModel]]] = {}
+
+    def register(self, name: str, func: Callable, args_schema: type[BaseModel]):
+        self.tools[name] = (func, args_schema)
+
+    def get_schemas_for_llm(self) -> list[dict]:
+        """Generate JSON schemas for LLM function calling."""
+        schemas = []
+        for name, (func, args_schema) in self.tools.items():
+            schemas.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": func.__doc__ or "",
+                    "parameters": args_schema.model_json_schema(),
+                }
+            })
+        return schemas
+
+    async def execute(self, tool_call: dict) -> str:
+        """Execute a tool call from LLM response."""
+        name = tool_call["name"]
+        args = tool_call["args"]
+
+        if name not in self.tools:
+            raise ValueError(f"Unknown tool: {name}")
+
+        func, args_schema = self.tools[name]
+
+        # Validate args
+        validated_args = args_schema(**args)
+
+        # Execute
+        result = await func(**validated_args.model_dump())
+
+        return str(result)
+
+class LLMCaller:
+    def __init__(self, api_key: str, tool_registry: ToolRegistry):
+        self.api_key = api_key
+        self.tool_registry = tool_registry
+
+    async def call_with_tools(self, messages: list[dict]) -> dict:
+        """Call LLM with tool definitions."""
+        import openai
+
+        client = openai.AsyncOpenAI(api_key=self.api_key)
+
+        response = await client.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            tools=self.tool_registry.get_schemas_for_llm(),
+        )
+
+        return self._parse_response(response)
+
+    def _parse_response(self, response) -> dict:
+        """Parse OpenAI response into structured format."""
+        message = response.choices[0].message
+
+        return {
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "args": json.loads(tc.function.arguments),
+                }
+                for tc in (message.tool_calls or [])
+            ]
+        }
+```
+
+**Complexity:** ~500 lines for basic, ~3000+ for production with retries, streaming, multiple providers.
+
+### Summary: Build vs Buy
+
+| Component | LangGraph Provides | DIY Complexity |
+|-----------|-------------------|----------------|
+| Graph execution | ✅ Full implementation | ~2000 lines |
+| State reducers | ✅ Annotation-based | ~1000 lines |
+| Checkpointing | ✅ Multiple backends | ~3000 lines |
+| Streaming | ✅ Multiple modes | ~2000 lines |
+| Parallel execution | ✅ Send primitive | ~1500 lines |
+| Tool calling | ✅ Via LangChain | ~3000 lines |
+| **Total** | **~0 lines** | **~12,500 lines** |
+
+**Verdict:** LangGraph provides ~12,500 lines of production-ready infrastructure. HogAI adds ~3,000 lines of PostHog-specific features on top.
+
+---
 
 ## Overview
 
@@ -759,6 +1455,93 @@ class MyAssistantGraph(BaseAssistantGraph[AssistantState, PartialAssistantState]
 
         return self.compile()
 ```
+
+---
+
+## Registered Nodes vs LLM Tools
+
+**Important distinction:** Nodes and Tools are different concepts.
+
+| Concept | What it is | Registered where | Examples |
+|---------|------------|------------------|----------|
+| **Nodes** | Graph execution steps | `_graph._nodes` via `add_node()` | `ROOT`, `ROOT_TOOLS`, `MEMORY_COLLECTOR` |
+| **Tools** | Functions the LLM can call | `toolkit_manager.get_tools()` | `CreateInsightTool`, `SearchTool`, `SwitchModeTool` |
+
+**Nodes** = Steps in the state machine (graph topology)
+**Tools** = Things bound to the LLM via `model.bind_tools(tools)`
+
+### Nodes Registered by compile_full_graph()
+
+The `AssistantGraph.compile_full_graph()` method registers these nodes:
+
+```python
+# Location: ee/hogai/chat_agent/graph.py
+
+def compile_full_graph(self):
+    return (
+        self
+        .add_title_generator()        # → TITLE_GENERATOR
+        .add_slash_command_handler()  # → SLASH_COMMAND_HANDLER
+        .add_memory_onboarding()      # → MEMORY_ONBOARDING
+                                      #   MEMORY_INITIALIZER
+                                      #   MEMORY_INITIALIZER_INTERRUPT
+                                      #   MEMORY_ONBOARDING_ENQUIRY
+                                      #   MEMORY_ONBOARDING_ENQUIRY_INTERRUPT
+                                      #   MEMORY_ONBOARDING_FINALIZE
+        .add_memory_collector()       # → MEMORY_COLLECTOR
+        .add_memory_collector_tools() # → MEMORY_COLLECTOR_TOOLS
+        .add_root()                   # → ROOT
+                                      #   ROOT_TOOLS
+        .compile()
+    )
+```
+
+**Complete node registry after compilation:**
+
+```python
+_graph._nodes = {
+    # Title generation
+    "title_generator": TitleGeneratorNode(...),
+
+    # Slash command handling
+    "slash_command_handler": SlashCommandHandlerNode(...),
+
+    # Memory onboarding flow
+    "memory_onboarding": MemoryOnboardingNode(...),
+    "memory_initializer": MemoryInitializerNode(...),
+    "memory_initializer_interrupt": MemoryInitializerInterruptNode(...),
+    "memory_onboarding_enquiry": MemoryOnboardingEnquiryNode(...),
+    "memory_onboarding_enquiry_interrupt": MemoryOnboardingEnquiryInterruptNode(...),
+    "memory_onboarding_finalize": MemoryOnboardingFinalizeNode(...),
+
+    # Memory collection
+    "memory_collector": MemoryCollectorNode(...),
+    "memory_collector_tools": MemoryCollectorToolsNode(...),
+
+    # Main agent loop (where LLM runs)
+    "root": AgentLoopGraphNode(...),
+    "root_tools": AgentLoopGraphToolsNode(...),
+}
+```
+
+### LLM Tools (Different from Nodes)
+
+Tools are retrieved dynamically inside the `ROOT` node execution:
+
+```python
+# Inside AgentExecutable.arun() (the ROOT node's logic)
+tools = await toolkit_manager.get_tools(state, config)
+# Returns: [CreateInsightTool, SearchTool, SwitchModeTool, ExecuteSQLTool, ...]
+
+model = ChatOpenAI(...).bind_tools(tools)  # Bind to LLM
+message = await model.ainvoke(prompts + messages)  # LLM can now call these tools
+```
+
+**Key difference:**
+- **Nodes** are registered once at graph construction time
+- **Tools** are fetched dynamically at execution time (can vary by mode)
+
+---
 
 ## Complete Implementation Guide
 

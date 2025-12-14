@@ -17,6 +17,336 @@ HogAI is a sophisticated LangGraph-based agent framework that powers PostHog's A
 
 ---
 
+## Multi-Mode Agent System
+
+HogAI uses **modes** (not separate agents) to specialize behavior. The same graph runs, but tools and prompts change based on the current mode.
+
+### Available Modes
+
+| Mode | Purpose | Tools Available |
+|------|---------|-----------------|
+| **Product Analytics** | Trends, funnels, retention insights | `CreateInsightTool`, `SearchTool` |
+| **SQL** | Direct HogQL queries | `ExecuteSQLTool`, `ReadDataTool` |
+| **Session Replay** | Find and filter recordings | `FilterSessionRecordingsTool` |
+
+### How Mode Switching Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  MODE SWITCHING FLOW                                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  User: "Can you write me a SQL query for daily active users?"               │
+│                                                                             │
+│  ROOT (Product Analytics mode):                                             │
+│      │                                                                      │
+│      ├─ LLM sees: [CreateInsightTool, SearchTool, SwitchModeTool]           │
+│      │                                                                      │
+│      ├─ LLM thinks: "This needs SQL mode"                                   │
+│      │                                                                      │
+│      ├─ LLM returns: tool_call: switch_mode(new_mode="sql")                 │
+│      │    ══════════════════════════════════════════════════════════════    │
+│      │    ▶ SSE TO FE: {"tool_name": "switch_mode", "args": {"new_mode": "sql"}}
+│      │       FE shows: "Switching to SQL mode..."                           │
+│      │    ══════════════════════════════════════════════════════════════    │
+│      │                                                                      │
+│      └─ State updated: agent_mode = "sql"                                   │
+│                                                                             │
+│  ROOT_TOOLS:                                                                │
+│      └─ Executes switch_mode → returns confirmation                         │
+│         router → "root" (loop back)                                         │
+│                                                                             │
+│  ROOT (SQL mode now!):                                                      │
+│      │                                                                      │
+│      ├─ LLM sees: [ExecuteSQLTool, ReadDataTool, SwitchModeTool]            │
+│      │            ↑ Different tools!                                        │
+│      │                                                                      │
+│      ├─ LLM returns: tool_call: execute_sql(query="SELECT ...")             │
+│      │    ══════════════════════════════════════════════════════════════    │
+│      │    ▶ SSE TO FE: SQL query result with ui_payload                     │
+│      │       FE renders: SQL results table                                  │
+│      │    ══════════════════════════════════════════════════════════════    │
+│      │                                                                      │
+│      └─ Continues in SQL mode...                                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### BE: Mode Detection and Tool Loading
+
+```python
+# Location: ee/hogai/core/agent_modes/executables.py
+
+class AgentExecutable:
+    async def arun(self, state: AssistantState, config):
+        # Tools loaded based on current mode
+        tools = await self._toolkit_manager.get_tools(state, config)
+        #                                             ↑
+        #                            state.agent_mode determines which tools
+
+        model = ChatOpenAI(...).bind_tools(tools)
+        message = await model.ainvoke(...)
+
+        # Detect if LLM called switch_mode
+        new_mode = self._get_updated_agent_mode(message, state.agent_mode)
+
+        return PartialAssistantState(
+            agent_mode=new_mode,  # ← Persisted in state for next iteration
+            messages=[...],
+        )
+
+    def _get_updated_agent_mode(self, message, current_mode):
+        """Scan tool_calls for switch_mode invocation."""
+        for tool_call in message.tool_calls or []:
+            if tool_call["name"] == "switch_mode":
+                return tool_call["args"]["new_mode"]
+        return current_mode
+```
+
+### FE: Handling Mode Changes
+
+```typescript
+// FE receives SSE event for switch_mode tool call
+interface SwitchModeEvent {
+  type: "tool_call";
+  tool_name: "switch_mode";
+  args: { new_mode: "sql" | "product_analytics" | "session_replay" };
+}
+
+// In useMaxAssistant hook:
+if (event.tool_name === "switch_mode") {
+  setCurrentMode(event.args.new_mode);
+  // UI updates to show new mode indicator
+  // Subsequent tool results render with mode-specific UI
+}
+```
+
+### Key Points
+
+1. **Mode stored in state** - `state.agent_mode` persists across loop iterations
+2. **SwitchModeTool injected into all modes** - LLM can always switch
+3. **Tools change per mode** - `toolkit_manager.get_tools()` returns different tools
+4. **FE notified via SSE** - Can update UI immediately when mode changes
+5. **Same graph, different behavior** - No separate agent graphs, just different tools/prompts
+
+---
+
+## Prompting Strategy
+
+### How the LLM Knows When to Switch Modes
+
+The LLM receives explicit guidance via two key prompts:
+
+**1. System Prompt (SWITCHING_MODES_PROMPT):**
+```
+You can switch between specialized modes that provide different tools
+and capabilities for specific task types.
+
+# When to switch:
+- You need a specific tool that's only available in another mode
+- The task clearly belongs to another mode's specialty
+  (e.g., SQL queries require sql mode)
+- You've determined your current tools are insufficient
+
+# When NOT to switch:
+- You already have the necessary tools in your current mode
+- You're just exploring or answering questions
+- You haven't checked if your current mode can handle the task
+```
+
+**2. SwitchModeTool Description (dynamically built):**
+```
+Use this tool to switch to a specialized mode with different tools.
+
+# Common tools (available in all modes)
+- memory_write, memory_read, todo_write, search...
+
+# Specialized modes
+- product_analytics – General-purpose mode for product analytics tasks.
+  [Mode tools: create_insight, search]
+- sql – Specialized mode for SQL queries against ClickHouse.
+  [Mode tools: execute_sql, read_data]
+- session_replay – Specialized mode for analyzing session recordings.
+  [Mode tools: filter_session_recordings, summarize_sessions]
+
+Decision framework:
+1. Check if you already have the necessary tools in your current mode
+2. If not, identify which mode provides the tools you need
+3. Switch to that mode using this tool
+```
+
+### How Mode Descriptions are Built
+
+Mode descriptions are dynamically assembled from the `mode_registry`:
+
+```python
+# Location: ee/hogai/tools/switch_mode.py
+
+async def _get_modes_prompt(mode_registry) -> str:
+    formatted_modes = []
+    for definition, tools in zip(mode_registry.values(), resolved_tools):
+        formatted_modes.append(
+            f"- {definition.mode.value} – {definition.mode_description}. "
+            f"[Mode tools: {', '.join([tool.get_name() for tool in tools])}]"
+        )
+    return "\n".join(formatted_modes)
+```
+
+Each `AgentModeDefinition` provides:
+- `mode` - The enum value (e.g., `AgentMode.SQL`)
+- `mode_description` - Concise description for the LLM
+- `toolkit_class` - Class that defines available tools
+
+---
+
+## Adding a New Mode (Developer Guide)
+
+### Step 1: Define the Mode Enum
+
+```python
+# Location: posthog/schema.py
+
+class AgentMode(str, Enum):
+    PRODUCT_ANALYTICS = "product_analytics"
+    SQL = "sql"
+    SESSION_REPLAY = "session_replay"
+    MY_NEW_MODE = "my_new_mode"  # ← Add here
+```
+
+### Step 2: Create the Toolkit
+
+```python
+# Location: ee/hogai/core/agent_modes/presets/my_new_mode.py
+
+from ee.hogai.core.agent_modes.toolkit import AgentToolkit
+from ee.hogai.tools.my_tool import MyTool
+
+class MyNewModeToolkit(AgentToolkit):
+    """Toolkit for my new mode."""
+
+    @property
+    def tools(self) -> list[type["MaxTool"]]:
+        return [
+            MyTool,
+            AnotherTool,
+        ]
+
+    # Optional: Add examples to guide TodoWriteTool behavior
+    POSITIVE_TODO_EXAMPLES = [
+        TodoWriteExample(
+            example="When user asks for X, create todo: 'Analyze X using MyTool'",
+            reasoning="This helps break down complex requests",
+        ),
+    ]
+```
+
+### Step 3: Create the Mode Definition
+
+```python
+# Location: ee/hogai/core/agent_modes/presets/my_new_mode.py
+
+from ee.hogai.core.agent_modes.factory import AgentModeDefinition
+from posthog.schema import AgentMode
+
+my_new_mode_agent = AgentModeDefinition(
+    mode=AgentMode.MY_NEW_MODE,
+    mode_description="Specialized mode for [describe purpose]. "
+                     "This mode allows you to [key capabilities].",
+    toolkit_class=MyNewModeToolkit,
+    # Optional: custom node classes
+    # node_class=MyCustomAgentExecutable,
+    # tools_node_class=MyCustomAgentToolsExecutable,
+)
+```
+
+### Step 4: Register the Mode
+
+```python
+# Location: ee/hogai/chat_agent/mode_manager.py
+
+from ee.hogai.core.agent_modes.presets.my_new_mode import my_new_mode_agent
+
+class ChatAgentModeManager(AgentModeManager):
+    @property
+    def mode_registry(self) -> dict[AgentMode, AgentModeDefinition]:
+        return {
+            AgentMode.PRODUCT_ANALYTICS: product_analytics_agent,
+            AgentMode.SQL: sql_agent,
+            AgentMode.SESSION_REPLAY: session_replay_agent,
+            AgentMode.MY_NEW_MODE: my_new_mode_agent,  # ← Add here
+        }
+```
+
+### Step 5: Create Your Tools
+
+```python
+# Location: ee/hogai/tools/my_tool.py
+
+from ee.hogai.tool import MaxTool
+
+MY_TOOL_PROMPT = """
+Use this tool when the user wants to [describe when to use].
+
+# Arguments
+- arg1: Description of argument 1
+- arg2: Description of argument 2
+
+# Examples
+User: "Do X with Y"
+→ my_tool(arg1="X", arg2="Y")
+"""
+
+class MyToolArgs(BaseModel):
+    arg1: str = Field(description="What arg1 is for")
+    arg2: str = Field(description="What arg2 is for")
+
+class MyTool(MaxTool):
+    name: str = "my_tool"
+    description: str = MY_TOOL_PROMPT
+    args_schema: type = MyToolArgs
+
+    async def _arun_impl(self, arg1: str, arg2: str) -> tuple[str, Any]:
+        # Do the work
+        result = await do_something(arg1, arg2)
+
+        # Return (text_for_llm, artifact_for_fe)
+        return f"Completed: {result}", {"my_tool": result}
+```
+
+### Checklist for New Modes
+
+- [ ] Add `AgentMode` enum value to `posthog/schema.py`
+- [ ] Create toolkit class with `tools` property
+- [ ] Create `AgentModeDefinition` with clear `mode_description`
+- [ ] Register in `ChatAgentModeManager.mode_registry`
+- [ ] Create any new tools needed (with good prompts!)
+- [ ] Add positive/negative examples for TodoWriteTool (optional)
+- [ ] Test that SwitchModeTool shows your mode in its description
+
+### Writing Good Mode Descriptions
+
+The `mode_description` is what the LLM sees when deciding whether to switch:
+
+**Bad:**
+```python
+mode_description="Mode for data stuff"
+```
+
+**Good:**
+```python
+mode_description="Specialized mode for SQL queries against ClickHouse. "
+                 "This mode allows you to query events, persons, sessions, "
+                 "and data warehouse sources. Use when the user needs raw "
+                 "data access or complex aggregations."
+```
+
+**Key elements:**
+1. What the mode specializes in
+2. What data/capabilities it provides
+3. When to use it (trigger phrases)
+
+---
+
 ## Frontend vs Backend Architecture
 
 ```
@@ -629,6 +959,30 @@ HogAI is a sophisticated LangGraph-based agent framework that powers PostHog's A
 │      │                                                                      │
 │      └─ _graph.astream(state, config, stream_mode=["values", "custom"])     │
 │                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │  _graph IS PRE-REGISTERED WITH NODES                                    ││
+│  │                                                                         ││
+│  │  The graph was built at construction time (compile_full_graph),         ││
+│  │  NOT at execution time. _graph already contains:                        ││
+│  │                                                                         ││
+│  │  _graph._nodes = {                                                      ││
+│  │      "root": AgentLoopGraphNode(...),        # Pre-registered           ││
+│  │      "root_tools": AgentLoopGraphToolsNode(...),                        ││
+│  │      "title_generator": TitleGeneratorNode(...),                        ││
+│  │      ... (12 nodes total)                                               ││
+│  │  }                                                                      ││
+│  │                                                                         ││
+│  │  See: docs/hogai/01-core-execution-framework.md                         ││
+│  │       Section: "Registered Nodes vs LLM Tools"                          ││
+│  │                                                                         ││
+│  │  When astream() runs, LangGraph:                                        ││
+│  │  1. Looks up node by name: _graph._nodes["root"]                        ││
+│  │  2. Calls it: node.__call__(state, config)                              ││
+│  │  3. Node returns PartialState, LangGraph merges it                      ││
+│  │  4. Calls router to determine next node                                 ││
+│  │  5. Repeats until END                                                   ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ↓
@@ -636,11 +990,30 @@ HogAI is a sophisticated LangGraph-based agent framework that powers PostHog's A
 │  STEP 3: BE Graph Execution - ROOT Node                                     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │  HOW LANGGRAPH CALLS POSTHOG'S AgentExecutable                          ││
+│  │                                                                         ││
+│  │  _graph._nodes["root"]                      # LangGraph looks up        ││
+│  │      ↓                                                                  ││
+│  │  AgentLoopGraphNode.__call__(state, config) # PostHog wrapper           ││
+│  │      ↓                                                                  ││
+│  │  ChatAgentModeManager.node                  # Gets mode-specific exec   ││
+│  │      ↓                                                                  ││
+│  │  AgentExecutable.__call__(state, config)    # Does the actual LLM work  ││
+│  │                                                                         ││
+│  │  LangGraph only cares that _nodes["root"] is callable.                  ││
+│  │  It doesn't know about PostHog's class hierarchy.                       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                             │
 │  BE: AgentExecutable.__call__(state, config)                                │
 │      │                                                                      │
-│      ├─ dispatcher.dispatch(NodeStartAction())  → SSE: status event         │
+│      ├─ dispatcher.dispatch(NodeStartAction())                              │
+│      │    ════════════════════════════════════════════════════════════════  │
+│      │    ▶ SSE STREAMS TO FE NOW: "root node starting"                     │
+│      │    ══════════════════════════════════════════════════════════════════  │
 │      │                                                                      │
 │      ├─ tools = await toolkit_manager.get_tools(state, config)              │
+│      │    # LLM TOOLS (not graph nodes!) - functions LLM can call           │
 │      │    # Returns: [CreateInsightTool, SearchTool, SwitchModeTool, ...]   │
 │      │                                                                      │
 │      ├─ prompts = await prompt_builder.get_prompts(state, config)           │
@@ -653,6 +1026,9 @@ HogAI is a sophisticated LangGraph-based agent framework that powers PostHog's A
 │      │    # message.tool_calls = [                                          │
 │      │    #   {"name": "create_insight", "args": {...}, "id": "tc_123"}     │
 │      │    # ]                                                               │
+│      │    ══════════════════════════════════════════════════════════════════  │
+│      │    ▶ SSE STREAMS TO FE NOW: LLM message with tool_calls              │
+│      │    ══════════════════════════════════════════════════════════════════  │
 │      │                                                                      │
 │      ├─ dispatcher.dispatch(NodeEndAction(state=partial_state))             │
 │      │                                                                      │
@@ -705,10 +1081,23 @@ HogAI is a sophisticated LangGraph-based agent framework that powers PostHog's A
 │                 ),                                                          │
 │             ]                                                               │
 │         )                                                                   │
+│         ══════════════════════════════════════════════════════════════════  │
+│         ▶ SSE STREAMS TO FE NOW: Tool result with ui_payload                │
+│            FE immediately renders the insight visualization                 │
+│         ══════════════════════════════════════════════════════════════════  │
 │                                                                             │
 │  BE: AgentToolsExecutable.router(state)                                     │
 │      │                                                                      │
 │      └─ return "root"  # Loop back for LLM to see tool result               │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │  THE LOOP: Keeps running until no tool_calls                            ││
+│  │                                                                         ││
+│  │  ROOT_TOOLS always returns "root" → back to ROOT node                   ││
+│  │  ROOT checks: does LLM response have tool_calls?                        ││
+│  │    - YES → Send(ROOT_TOOLS) again (loop continues)                      ││
+│  │    - NO  → return END (loop exits)                                      ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -726,104 +1115,73 @@ HogAI is a sophisticated LangGraph-based agent framework that powers PostHog's A
 │      │    # LLM sees tool result, generates final response                  │
 │      │    # message.content = "I've created a trends insight..."            │
 │      │    # message.tool_calls = []  (no more tools)                        │
+│      │    ══════════════════════════════════════════════════════════════════  │
+│      │    ▶ SSE STREAMS TO FE NOW: Final AI response text                   │
+│      │       (tokens stream incrementally as LLM generates)                 │
+│      │    ══════════════════════════════════════════════════════════════════  │
 │      │                                                                      │
 │      └─ return PartialAssistantState(messages=[AIMessage(...)])             │
 │                                                                             │
 │  BE: AgentExecutable.router(state)                                          │
 │      │                                                                      │
-│      └─ return END  # No tool calls, exit graph                             │
+│      └─ return END  # No tool calls → loop exits                            │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 6: BE → FE (SSE Stream)                                               │
+│  STREAMING TIMELINE (Real-time, not batched!)                               │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  BE: BaseAgentRunner._process_update(update)                                │
-│      │                                                                      │
-│      └─ yields:                                                             │
-│           (MESSAGE, AIMessage(tool_calls=[...]))         # Step 3 result    │
-│           (MESSAGE, ToolCallMessage(ui_payload={...}))   # Step 4 result    │
-│           (MESSAGE, AIMessage(content="I've created...")) # Step 5 result   │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │  FE receives SSE events AS THEY HAPPEN, not after all steps complete:  │ │
+│  │                                                                        │ │
+│  │  T=0ms    Step 3 starts  → SSE: NodeStartAction                        │ │
+│  │  T=500ms  LLM responds   → SSE: AIMessage(tool_calls=[...])            │ │
+│  │  T=501ms  Step 4 starts  → SSE: NodeStartAction (root_tools)           │ │
+│  │  T=2000ms Tool completes → SSE: ToolCallMessage(ui_payload={...})      │ │
+│  │           ▶ FE RENDERS CHART IMMEDIATELY (doesn't wait for LLM)        │ │
+│  │  T=2001ms Step 5 starts  → SSE: NodeStartAction (root, 2nd iter)       │ │
+│  │  T=2100ms LLM token 1    → SSE: "I've"                                 │ │
+│  │  T=2150ms LLM token 2    → SSE: " created"                             │ │
+│  │  T=2200ms LLM token 3    → SSE: " a trends"                            │ │
+│  │           ▶ FE STREAMS TEXT AS TOKENS ARRIVE                           │ │
+│  │  T=2500ms LLM done       → SSE: AIMessage(content="I've created...")   │ │
+│  │  T=2501ms Graph ends     → SSE: stream closes                          │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                             │
-│  BE: sse_generator() converts to SSE format:                                │
-│      event: MESSAGE                                                         │
-│      data: {"type": "ai", "content": "", "tool_calls": [...]}               │
-│                                                                             │
-│      event: MESSAGE                                                         │
-│      data: {"type": "tool_call", "ui_payload": {"create_insight": {...}}}   │
-│                                                                             │
-│      event: MESSAGE                                                         │
-│      data: {"type": "ai", "content": "I've created a trends insight..."}    │
+│  For PARALLEL tool calls (e.g., 2 tools):                                   │
+│  T=501ms  ROOT_TOOLS (tool 1) starts                                        │
+│  T=502ms  ROOT_TOOLS (tool 2) starts  (parallel!)                           │
+│  T=1500ms Tool 2 completes → SSE immediately → FE renders                   │
+│  T=2000ms Tool 1 completes → SSE immediately → FE renders                   │
+│           ▶ Each result streams as soon as ready, no waiting for siblings   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 7: FE Rendering                                                       │
+│  STEP 6: FE Rendering (Incremental)                                         │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  FE: useMaxAssistant.parseSSEEvent(event)                                   │
 │      │                                                                      │
-│      ├─ Adds messages to state                                              │
+│      ├─ Each SSE event triggers immediate state update                      │
 │      ├─ setMessages([...messages, newMessage])                              │
 │      │                                                                      │
-│      └─ Re-renders UI                                                       │
+│      └─ React re-renders affected components                                │
 │                                                                             │
-│  FE: MessageRenderer component                                              │
+│  FE: MessageRenderer component (renders incrementally)                      │
 │      │                                                                      │
-│      ├─ <ToolCallMessage ui_payload={create_insight: {...}}>                │
-│      │    └─ <InsightVisualization query={...} />  # Renders chart          │
+│      ├─ T=2000ms: <ToolCallMessage ui_payload={create_insight: {...}}>      │
+│      │              └─ <InsightVisualization />  # Chart appears!           │
 │      │                                                                      │
-│      └─ <AssistantMessage content="I've created a trends insight..." />     │
+│      └─ T=2100ms+: <AssistantMessage content="I've..." />                   │
+│                      └─ Text streams in token by token                      │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## State Flow Summary
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STATE LAYER (BE)                                                           │
-│  Location: ee/hogai/utils/types/base.py                                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  class AssistantState(BaseStateWithMessages):                               │
-│      """Full state - flows through entire graph."""                         │
-│                                                                             │
-│      messages: Annotated[list[AssistantMessage], add_and_merge_messages]    │
-│      agent_mode: AgentMode | None = None                                    │
-│      root_tool_call_id: str | None = None      # Current tool being executed│
-│      root_tool_calls_count: int = 0            # Track iterations           │
-│      start_id: str | None = None               # Conversation window start  │
-│      start_dt: datetime | None = None          # For cache expiration       │
-│      # ... 30+ more fields                                                  │
-│                                                                             │
-│  class PartialAssistantState(BaseStateWithMessages):                        │
-│      """Partial state - nodes return updates only."""                       │
-│                                                                             │
-│      messages: list[AssistantMessage] | ReplaceMessages | None = None       │
-│      agent_mode: AgentMode | None = None                                    │
-│      # All fields optional - only set what changed                          │
-│                                                                             │
-│  def add_and_merge_messages(                                                │
-│      existing: list[AssistantMessage],                                      │
-│      updates: list[AssistantMessage],                                       │
-│  ) → list[AssistantMessage]:                                                │
-│      """                                                                    │
-│      Reducer for messages field:                                            │
-│      - Messages with same ID: update in place                               │
-│      - Messages with new ID: append                                         │
-│      - ReplaceMessages wrapper: replace entire list                         │
-│      """                                                                    │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
 
 ## Documentation Index
 
