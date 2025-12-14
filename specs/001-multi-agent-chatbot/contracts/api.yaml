@@ -1,0 +1,328 @@
+openapi: 3.1.0
+info:
+  title: Multi-Agent Chatbot API
+  description: AG-UI compatible chat API with multi-agent mode support
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /chat:
+    post:
+      summary: Send a chat message and receive streamed response
+      description: |
+        Initiates a chat conversation with SSE streaming response.
+        Supports tool calling, mode switching, and context injection.
+      operationId: chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: SSE stream of AG-UI events
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/AGUIEvent'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /modes:
+    get:
+      summary: List available agent modes
+      description: Returns all registered agent modes with their descriptions and tools
+      operationId: listModes
+      responses:
+        '200':
+          description: List of agent modes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AgentMode'
+
+  /tools:
+    get:
+      summary: List available tools
+      description: Returns all registered tools, optionally filtered by mode
+      operationId: listTools
+      parameters:
+        - name: mode
+          in: query
+          description: Filter tools by agent mode
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of tools
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ToolDefinition'
+
+  /health:
+    get:
+      summary: Health check endpoint
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy]
+                  version:
+                    type: string
+
+components:
+  schemas:
+    ChatRequest:
+      type: object
+      required:
+        - messages
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+          description: Conversation history
+        mode:
+          type: string
+          description: Agent mode to use (default if not specified)
+          default: default
+        context:
+          $ref: '#/components/schemas/ContextPayload'
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolDefinition'
+          description: Additional tools to make available (frontend tools)
+        run_id:
+          type: string
+          description: Unique identifier for this run
+
+    Message:
+      type: object
+      required:
+        - id
+        - type
+        - content
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          $ref: '#/components/schemas/MessageType'
+        content:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        metadata:
+          type: object
+          additionalProperties: true
+
+    MessageType:
+      type: string
+      enum:
+        - human
+        - assistant
+        - tool_call
+        - tool_result
+        - context
+
+    ContextPayload:
+      type: object
+      properties:
+        ui_context:
+          type: object
+          description: Current UI state
+          additionalProperties: true
+        user_preferences:
+          type: object
+          description: User settings
+          additionalProperties: true
+        session_data:
+          type: object
+          description: Session information
+          additionalProperties: true
+
+    AGUIEvent:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          $ref: '#/components/schemas/AGUIEventType'
+        run_id:
+          type: string
+        message_id:
+          type: string
+        tool_call_id:
+          type: string
+        content:
+          type: string
+        delta:
+          type: string
+        arguments:
+          type: object
+        result:
+          type: string
+        artifact:
+          type: object
+        error:
+          type: string
+        mode:
+          type: string
+
+    AGUIEventType:
+      type: string
+      enum:
+        - RUN_STARTED
+        - RUN_FINISHED
+        - TEXT_MESSAGE_START
+        - TEXT_MESSAGE_CONTENT
+        - TEXT_MESSAGE_END
+        - TOOL_CALL_START
+        - TOOL_CALL_ARGS
+        - TOOL_CALL_END
+        - TOOL_CALL_RESULT
+        - MODE_SWITCHED
+        - CONTEXT_INJECTED
+        - ERROR
+
+    AgentMode:
+      type: object
+      required:
+        - name
+        - description
+        - tools
+      properties:
+        name:
+          type: string
+          description: Unique mode identifier
+        description:
+          type: string
+          description: Human-readable description
+        tools:
+          type: array
+          items:
+            type: string
+          description: Tool names available in this mode
+        system_prompt:
+          type: string
+          description: Additional system prompt
+
+    ToolDefinition:
+      type: object
+      required:
+        - name
+        - description
+        - args_schema
+        - execution_location
+      properties:
+        name:
+          type: string
+          description: Unique tool identifier
+        description:
+          type: string
+          description: When to use this tool
+        args_schema:
+          type: object
+          description: JSON Schema for arguments
+        execution_location:
+          $ref: '#/components/schemas/ExecutionLocation'
+        mode:
+          type: string
+          description: Restrict to specific mode
+          nullable: true
+
+    ExecutionLocation:
+      type: string
+      enum:
+        - backend
+        - frontend
+
+    ToolCall:
+      type: object
+      required:
+        - id
+        - name
+        - arguments
+        - execution_location
+        - status
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        arguments:
+          type: object
+        execution_location:
+          $ref: '#/components/schemas/ExecutionLocation'
+        status:
+          $ref: '#/components/schemas/ToolCallStatus'
+
+    ToolCallStatus:
+      type: string
+      enum:
+        - pending
+        - executing
+        - complete
+        - error
+
+    ToolResult:
+      type: object
+      required:
+        - tool_call_id
+        - content
+      properties:
+        tool_call_id:
+          type: string
+        content:
+          type: string
+          description: Text result for LLM
+        artifact:
+          type: object
+          description: Structured data for UI
+        error:
+          type: string
+
+    Error:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          description: Error code
+        message:
+          type: string
+          description: Human-readable message
+        details:
+          type: object
+          description: Additional error context

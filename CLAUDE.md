@@ -106,3 +106,12 @@ cd frontend && npm run test:headed
 Requires `.env` file in root with:
 - `OPENROUTER_API_KEY`: OpenRouter API key
 - `MODEL`: Model identifier (default: `amazon/nova-2-lite-v1:free`)
+
+BEFORE ANYTHING ELSE: run 'bd onboard' and follow the instructions
+
+## Active Technologies
+- Python 3.11 (backend), TypeScript 5.6 (frontend) (001-multi-agent-chatbot)
+- In-memory conversation state (no persistent storage for MVP) (001-multi-agent-chatbot)
+
+## Recent Changes
+- 001-multi-agent-chatbot: Added Python 3.11 (backend), TypeScript 5.6 (frontend)
