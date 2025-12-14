@@ -1,28 +1,62 @@
 import { useCallback, useRef, useState } from 'react';
 import { useCopilotContext } from '../context/CopilotContext';
 import { usePayloadContext } from '../context/PayloadContext';
-import { FRONTEND_TOOLS, getToolsForBackend } from '../tools';
-import { AGUIEvent, CopilotAction, EventType, Message, TodoItem, ToolCall } from '../types';
+import { BackendToolFormat, FRONTEND_TOOLS, getToolsForBackend } from '../tools';
+import type {
+  AGUIEvent,
+  CopilotAction,
+  Message,
+  TodoItem,
+  ToolCall,
+  ToolCallData,
+} from '../types';
+import { EventType } from '../types';
 
+/** Backend API URL */
 const API_URL = 'http://localhost:8000';
+
+/** Maximum depth for automatic follow-up calls after tool execution */
 const MAX_FOLLOW_UP_DEPTH = 5;
 
-// Type for the LLM request payload
+/** Message payload for LLM API request */
+export interface LLMMessagePayload {
+  role: string;
+  content: string;
+  toolCalls?: ToolCallData[];
+  toolCallId?: string;
+}
+
+/** Full payload for the /chat API endpoint */
 export interface LLMPayload {
-  messages: Array<{
-    role: string;
-    content: string;
-    toolCalls?: Array<{ id: string; name: string; arguments: string }>;
-    toolCallId?: string;
-  }>;
-  frontendTools: Array<{ name: string; description: string; parameters: unknown }>;
+  messages: LLMMessagePayload[];
+  frontendTools: BackendToolFormat[];
   threadId: string;
   runId: string;
   context?: string;
 }
 
-// New context-aware useChat with auto follow-up
-export function useChatWithContext() {
+/** Return type for useChatWithContext hook */
+export interface UseChatResult {
+  messages: Message[];
+  isLoading: boolean;
+  sendMessage: (content: string) => Promise<void>;
+  clearMessages: () => void;
+  lastPayload: LLMPayload | null;
+}
+
+/** Result from handling a single AG-UI event */
+interface EventHandlerResult {
+  frontendToolExecuted: boolean;
+  backendToolExecuted: boolean;
+  action?: CopilotAction;
+  result?: string;
+}
+
+/**
+ * Context-aware chat hook with automatic follow-up after tool execution.
+ * Manages conversation state and handles AG-UI protocol events.
+ */
+export function useChatWithContext(): UseChatResult {
   const { actions, getContextString } = useCopilotContext();
   const { lastPayload, setLastPayload } = usePayloadContext();
   const [messages, setMessages] = useState<Message[]>([]);
@@ -182,9 +216,15 @@ export function useChatWithContext() {
   return { messages, isLoading, sendMessage, clearMessages, lastPayload };
 }
 
-// Convert context actions to backend format
-function getToolsForBackendFromActions(actions: Map<string, CopilotAction>) {
-  const tools = [];
+/**
+ * Convert context actions to backend tool format.
+ * Merges dynamic actions with static frontend tools.
+ */
+function getToolsForBackendFromActions(
+  actions: Map<string, CopilotAction>
+): BackendToolFormat[] {
+  const tools: BackendToolFormat[] = [];
+
   for (const [name, action] of actions) {
     const properties: Record<string, { type: string; description: string }> = {};
     const required: string[] = [];
@@ -215,8 +255,10 @@ function getToolsForBackendFromActions(actions: Map<string, CopilotAction>) {
   return [...tools, ...staticTools];
 }
 
-// Helper function to attach a tool call to the last assistant message
-// This is required for OpenAI API compatibility - tool results must have matching assistant tool_calls
+/**
+ * Attach a tool call to the last assistant message.
+ * Required for OpenAI API compatibility - tool results must have matching assistant tool_calls.
+ */
 function attachToolCallToAssistant(
   messages: Message[],
   toolCallId: string,
@@ -284,8 +326,11 @@ function attachToolCallToAssistant(
   return updated;
 }
 
-// Helper function specifically for todo_write - updates existing todo list instead of creating new one
-// This ensures a single, evolving todo list throughout the conversation
+/**
+ * Attach or update a todo_write tool call.
+ * Updates existing todo list instead of creating new one,
+ * ensuring a single evolving todo list throughout the conversation.
+ */
 function attachOrUpdateTodoWrite(
   messages: Message[],
   toolCallId: string,
@@ -321,8 +366,10 @@ function attachOrUpdateTodoWrite(
   );
 }
 
-// Helper function to get the current todo list from messages
-// Used to attach todo state to tool result messages for visual re-rendering
+/**
+ * Get the current todo list from messages.
+ * Searches backwards for the most recent todo_write tool call.
+ */
 function getCurrentTodoList(messages: Message[]): TodoItem[] | undefined {
   // Search backwards for the most recent todo_write tool call
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -342,8 +389,10 @@ function getCurrentTodoList(messages: Message[]): TodoItem[] | undefined {
   return undefined;
 }
 
-// Helper function to get todo list with completed tasks based on tool execution count
-// Called when a tool finishes to show the user progressive completion
+/**
+ * Get todo list with completed tasks based on tool execution count.
+ * Called when a tool finishes to show progressive completion to the user.
+ */
 function getTodoListWithCompletedTask(messages: Message[]): TodoItem[] | undefined {
   const todos = getCurrentTodoList(messages);
   if (!todos) return undefined;
@@ -375,7 +424,12 @@ function getTodoListWithCompletedTask(messages: Message[]): TodoItem[] | undefin
   });
 }
 
-// Handle event with context actions and return tool execution info
+/**
+ * Handle an AG-UI event with context actions.
+ * Processes streaming events and executes frontend tools when needed.
+ *
+ * @returns Information about tool execution for follow-up handling
+ */
 async function handleEventWithContext(
   event: AGUIEvent,
   currentText: string,
@@ -387,7 +441,7 @@ async function handleEventWithContext(
   setCurrentMessageId: (id: string | null) => void,
   setMessages: (messages: Message[]) => void,
   currentMessages: Message[]
-): Promise<{ frontendToolExecuted: boolean; backendToolExecuted: boolean; action?: CopilotAction; result?: string }> {
+): Promise<EventHandlerResult> {
   switch (event.type) {
     case EventType.RUN_STARTED:
       console.log('[AG-UI] Run started:', event.runId, 'input:', event.input);
