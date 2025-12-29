@@ -3,13 +3,16 @@ import { renderHook, act, waitFor } from '@testing-library/react';
 import React from 'react';
 
 import { CopilotProvider, useCopilotContext } from '../src/context/CopilotContext';
+import { PayloadProvider } from '../src/context/PayloadContext';
 import { useCopilotAction } from '../src/hooks/useCopilotAction';
 import { useChatWithContext } from '../src/hooks/useChat';
 import { EventType } from '../src/types';
 
-// Helper to wrap hooks with provider
+// Helper to wrap hooks with both providers
 const wrapper = ({ children }: { children: React.ReactNode }) => (
-  <CopilotProvider>{children}</CopilotProvider>
+  <CopilotProvider>
+    <PayloadProvider>{children}</PayloadProvider>
+  </CopilotProvider>
 );
 
 // Helper to create SSE stream data
