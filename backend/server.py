@@ -52,6 +52,9 @@ from ag_ui.core import (
     ToolCallResultEvent,
     # Tool call events
     ToolCallStartEvent,
+    # State management events
+    StateSnapshotEvent,
+    StateDeltaEvent,
 )
 from ag_ui.encoder import EventEncoder
 from dotenv import load_dotenv
@@ -72,6 +75,47 @@ class TodoStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
+
+
+class ToolExecutionStatus(str, Enum):
+    """Status for system-level tool execution tracking."""
+    PENDING = "pending"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ToolType(str, Enum):
+    """Type of tool - frontend or backend."""
+    FRONTEND = "frontend"
+    BACKEND = "backend"
+
+
+class ToolExecutionItem(BaseModel):
+    """System-level tracking for a single tool call."""
+    id: str = Field(..., description="Unique tool call ID")
+    name: str = Field(..., description="Tool name")
+    arguments: str = Field(default="{}", description="JSON-encoded arguments")
+    tool_type: ToolType = Field(..., description="Frontend or backend tool")
+    status: ToolExecutionStatus = Field(
+        default=ToolExecutionStatus.PENDING,
+        description="Current execution status"
+    )
+    result: str | None = Field(default=None, description="Execution result")
+    error: str | None = Field(default=None, description="Error message if failed")
+    started_at: int | None = Field(default=None, description="Start timestamp (ms)")
+    completed_at: int | None = Field(default=None, description="Completion timestamp (ms)")
+
+    model_config = {"use_enum_values": True}
+
+
+class ToolExecutionState(BaseModel):
+    """Full execution state for a run."""
+    run_id: str = Field(..., description="Run ID this state belongs to")
+    items: list[ToolExecutionItem] = Field(default_factory=list, description="Tool execution items")
+    created_at: int = Field(..., description="Creation timestamp (ms)")
+
+    model_config = {"use_enum_values": True}
 
 
 class TodoItem(BaseModel):
@@ -960,6 +1004,9 @@ async def chat(request: Request) -> StreamingResponse:
             ))
 
             # Process completed tool calls
+            # Initialize tool_id_to_index for STATE_DELTA path lookups
+            tool_id_to_index: dict[str, int] = {}
+
             if current_tool_calls:
                 logger.info(f"🔧 EXECUTING {len(current_tool_calls)} TOOL(S)")
                 # STEP_STARTED: Tool execution
@@ -968,9 +1015,38 @@ async def chat(request: Request) -> StreamingResponse:
                     timestamp=get_timestamp()
                 ))
 
-            for _idx, tool_call in current_tool_calls.items():
+                # Build ToolExecutionState with all tool calls
+                # Also build a mapping from tool_call_id to index for STATE_DELTA updates
+                execution_items: list[ToolExecutionItem] = []
+                for item_idx, (_dict_key, tc) in enumerate(current_tool_calls.items()):
+                    tool_type = ToolType.FRONTEND if tc["name"] in frontend_tool_names else ToolType.BACKEND
+                    execution_items.append(ToolExecutionItem(
+                        id=tc["id"],
+                        name=tc["name"],
+                        arguments=tc["arguments"],
+                        tool_type=tool_type,
+                        status=ToolExecutionStatus.PENDING,
+                    ))
+                    tool_id_to_index[tc["id"]] = item_idx
+
+                execution_state = ToolExecutionState(
+                    run_id=run_id,
+                    items=execution_items,
+                    created_at=get_timestamp(),
+                )
+
+                # Send STATE_SNAPSHOT with full execution state
+                yield encoder.encode(StateSnapshotEvent(
+                    snapshot={
+                        "toolExecutions": execution_state.model_dump()
+                    }
+                ))
+                logger.info(f"   📊 STATE_SNAPSHOT sent: {len(execution_items)} tool(s)")
+
+            for _dict_key, tool_call in current_tool_calls.items():
                 tool_name = tool_call["name"]
                 tool_call_id = tool_call["id"]
+                item_index = tool_id_to_index.get(tool_call_id, 0)
 
                 # Signal end of tool call arguments
                 yield encoder.encode(ToolCallEndEvent(tool_call_id=tool_call_id))
@@ -979,6 +1055,15 @@ async def chat(request: Request) -> StreamingResponse:
                 if tool_name in BACKEND_TOOLS:
                     tool_start = time.time()
                     logger.info(f"   🔨 Executing: {tool_name}")
+
+                    # Send STATE_DELTA: status = executing
+                    yield encoder.encode(StateDeltaEvent(
+                        delta=[
+                            {"op": "replace", "path": f"/toolExecutions/items/{item_index}/status", "value": "executing"},
+                            {"op": "replace", "path": f"/toolExecutions/items/{item_index}/started_at", "value": get_timestamp()},
+                        ]
+                    ))
+
                     try:
                         args = json.loads(tool_call["arguments"]) if tool_call["arguments"] else {}
                         handler = BACKEND_TOOLS[tool_name]["handler"]
@@ -987,6 +1072,15 @@ async def chat(request: Request) -> StreamingResponse:
                         tool_time = (time.time() - tool_start) * 1000
                         result_preview = result[:50] if len(result) > 50 else result
                         logger.info(f"   ✅ {tool_name} completed: {tool_time:.0f}ms | Result: {result_preview}...")
+
+                        # Send STATE_DELTA: status = completed
+                        yield encoder.encode(StateDeltaEvent(
+                            delta=[
+                                {"op": "replace", "path": f"/toolExecutions/items/{item_index}/status", "value": "completed"},
+                                {"op": "replace", "path": f"/toolExecutions/items/{item_index}/result", "value": result},
+                                {"op": "replace", "path": f"/toolExecutions/items/{item_index}/completed_at", "value": get_timestamp()},
+                            ]
+                        ))
 
                         # TOOL_CALL_RESULT with result
                         result_message_id = str(uuid.uuid4())
@@ -999,6 +1093,16 @@ async def chat(request: Request) -> StreamingResponse:
                     except Exception as e:
                         tool_time = (time.time() - tool_start) * 1000
                         logger.error(f"   ❌ {tool_name} failed: {tool_time:.0f}ms | Error: {str(e)}")
+
+                        # Send STATE_DELTA: status = failed
+                        yield encoder.encode(StateDeltaEvent(
+                            delta=[
+                                {"op": "replace", "path": f"/toolExecutions/items/{item_index}/status", "value": "failed"},
+                                {"op": "replace", "path": f"/toolExecutions/items/{item_index}/error", "value": str(e)},
+                                {"op": "replace", "path": f"/toolExecutions/items/{item_index}/completed_at", "value": get_timestamp()},
+                            ]
+                        ))
+
                         result_message_id = str(uuid.uuid4())
                         yield encoder.encode(ToolCallResultEvent(
                             message_id=result_message_id,
@@ -1007,8 +1111,13 @@ async def chat(request: Request) -> StreamingResponse:
                             role="tool"
                         ))
                 else:
-                    # Frontend tools: no result from server (client executes them)
-                    logger.info(f"   📤 Frontend tool: {tool_name} (client will execute)")
+                    # Frontend tool encountered - STOP processing remaining tools
+                    # The frontend will execute this tool, add result to messages,
+                    # and auto-follow-up will send a new request with the result.
+                    # This prevents executing subsequent BE tools with wrong/missing data.
+                    logger.info(f"   📤 Frontend tool: {tool_name} - stopping to await client execution")
+                    logger.info(f"   ⏸️  Remaining tools will execute on follow-up request")
+                    break  # EXIT THE LOOP - critical for correctness!
 
             # STEP_FINISHED: Tool execution complete
             if current_tool_calls:

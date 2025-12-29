@@ -5,10 +5,13 @@ import { BackendToolFormat, FRONTEND_TOOLS, getToolsForBackend } from '../tools'
 import type {
   AGUIEvent,
   CopilotAction,
+  JsonPatchOperation,
   Message,
   TodoItem,
   ToolCall,
   ToolCallData,
+  ToolExecutionState,
+  ToolExecutionItem,
 } from '../types';
 import { EventType } from '../types';
 
@@ -75,6 +78,7 @@ export function useChatWithContext(): UseChatResult {
     depth: number = 0
   ): Promise<Message[]> => {
     if (depth > MAX_FOLLOW_UP_DEPTH) {
+      console.warn('[AG-UI] Max follow-up depth reached:', depth);
       return currentMessages;
     }
 
@@ -100,11 +104,21 @@ export function useChatWithContext(): UseChatResult {
     // Save the payload for debugging
     setLastPayload(payload);
 
-    const response = await fetch(`${API_URL}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    // Add timeout to prevent indefinite hangs
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout
+
+    let response: Response;
+    try {
+      response = await fetch(`${API_URL}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     const reader = response.body?.getReader();
     if (!reader) throw new Error('No response body');
@@ -119,6 +133,8 @@ export function useChatWithContext(): UseChatResult {
     let frontendToolExecuted = false;
     let backendToolExecuted = false;
     let toolAction: CopilotAction | undefined;
+    // Tool execution state tracking (PostHog pattern)
+    let toolExecutionState: ToolExecutionState | null = null;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -134,9 +150,15 @@ export function useChatWithContext(): UseChatResult {
         for (const line of eventStr.split('\n')) {
           if (!line.startsWith('data: ')) continue;
 
+          let event: AGUIEvent;
           try {
-            const event: AGUIEvent = JSON.parse(line.slice(6));
+            event = JSON.parse(line.slice(6));
+          } catch {
+            // Ignore JSON parse errors for incomplete chunks
+            continue;
+          }
 
+          try {
             const result = await handleEventWithContext(
               event,
               currentText,
@@ -153,7 +175,9 @@ export function useChatWithContext(): UseChatResult {
                 updatedMessages = newMsgs;
                 setMessages(newMsgs);
               },
-              updatedMessages
+              updatedMessages,
+              toolExecutionState,
+              (state) => { toolExecutionState = state; }
             );
 
             if (result.frontendToolExecuted) {
@@ -163,8 +187,92 @@ export function useChatWithContext(): UseChatResult {
             if (result.backendToolExecuted) {
               backendToolExecuted = true;
             }
-          } catch {
-            // Ignore JSON parse errors for incomplete chunks
+          } catch (err) {
+            console.error('[AG-UI] Error handling event:', event.type, err);
+          }
+        }
+      }
+    }
+
+    // Execute pending frontend tools from toolExecutionState
+    // This is the PostHog pattern: after stream ends, execute all pending FE tools
+    // Cast needed because TypeScript doesn't track that the callback can mutate the variable
+    const execState = toolExecutionState as ToolExecutionState | null;
+    if (execState && execState.items) {
+      const pendingFETools: ToolExecutionItem[] = execState.items.filter(
+        (item: ToolExecutionItem) => item.tool_type === 'frontend' && item.status === 'pending'
+      );
+
+      if (pendingFETools.length > 0) {
+        console.log('[AG-UI] Executing pending FE tools:', pendingFETools.map((t: ToolExecutionItem) => t.name));
+
+        for (const feToolItem of pendingFETools) {
+          const toolCall = toolCalls[feToolItem.id];
+          if (!toolCall) {
+            console.warn('[AG-UI] No toolCall found for FE tool:', feToolItem.id);
+            continue;
+          }
+
+          // Check context actions first, then static tools
+          const contextAction = actionsRef.current.get(toolCall.name);
+          const staticTool = FRONTEND_TOOLS[toolCall.name];
+
+          try {
+            const args = JSON.parse(toolCall.arguments || '{}');
+            let result: string;
+
+            if (contextAction) {
+              result = await Promise.resolve(contextAction.handler(args));
+              frontendToolExecuted = true;
+              toolAction = contextAction;
+            } else if (staticTool) {
+              result = staticTool.handler(args);
+            } else {
+              console.warn('[AG-UI] Unknown FE tool:', toolCall.name);
+              continue;
+            }
+
+            console.log('[AG-UI] FE tool executed:', toolCall.name, 'result:', result);
+
+            // Attach tool call to assistant message
+            const updatedWithToolCall = attachToolCallToAssistant(
+              updatedMessages,
+              feToolItem.id,
+              toolCall.name,
+              toolCall.arguments,
+              lastAssistantMessageId
+            );
+
+            // Add tool result message
+            const toolMessage: Message = {
+              role: 'tool',
+              content: `Frontend tool "${toolCall.name}" executed: ${result}`,
+              isFrontend: true,
+              toolCallId: feToolItem.id,
+              currentTodos: getTodoListWithCompletedTask(updatedWithToolCall),
+            };
+            updatedMessages = [...updatedWithToolCall, toolMessage];
+            setMessages(updatedMessages);
+          } catch (e) {
+            const errorMsg = e instanceof Error ? e.message : 'Unknown error';
+            console.error('[AG-UI] FE tool error:', toolCall.name, e);
+
+            const updatedWithToolCall = attachToolCallToAssistant(
+              updatedMessages,
+              feToolItem.id,
+              toolCall.name,
+              toolCall.arguments,
+              lastAssistantMessageId
+            );
+
+            const errorMessage: Message = {
+              role: 'tool',
+              content: `Frontend tool "${toolCall.name}" error: ${errorMsg}`,
+              isFrontend: true,
+              toolCallId: feToolItem.id,
+            };
+            updatedMessages = [...updatedWithToolCall, errorMessage];
+            setMessages(updatedMessages);
           }
         }
       }
@@ -175,10 +283,21 @@ export function useChatWithContext(): UseChatResult {
       (frontendToolExecuted && toolAction && !toolAction.disableFollowUp) ||
       backendToolExecuted;
 
+    console.log('[AG-UI] Follow-up check:', {
+      depth,
+      frontendToolExecuted,
+      backendToolExecuted,
+      toolAction: toolAction?.name,
+      disableFollowUp: toolAction?.disableFollowUp,
+      shouldFollowUp,
+    });
+
     if (shouldFollowUp) {
+      console.log('[AG-UI] Triggering follow-up at depth', depth + 1);
       return sendMessageInternal(updatedMessages, depth + 1);
     }
 
+    console.log('[AG-UI] No follow-up needed, returning messages');
     return updatedMessages;
   }, []);
 
@@ -425,6 +544,42 @@ function getTodoListWithCompletedTask(messages: Message[]): TodoItem[] | undefin
 }
 
 /**
+ * Apply JSON Patch operations to the tool execution state.
+ * Implements a subset of RFC 6902 needed for STATE_DELTA events.
+ */
+function applyJsonPatch(
+  state: ToolExecutionState,
+  operations: readonly JsonPatchOperation[]
+): ToolExecutionState {
+  // Deep clone to avoid mutation
+  const newState = JSON.parse(JSON.stringify(state)) as ToolExecutionState;
+
+  for (const op of operations) {
+    // Parse path: /toolExecutions/items/0/status -> ["toolExecutions", "items", "0", "status"]
+    const pathParts = op.path.split('/').filter(Boolean);
+
+    // Navigate to parent and apply operation
+    // For our use case, we only need to handle paths like /toolExecutions/items/N/field
+    if (pathParts[0] === 'toolExecutions' && pathParts[1] === 'items' && pathParts.length >= 4) {
+      const itemIndex = parseInt(pathParts[2], 10);
+      const field = pathParts[3] as keyof ToolExecutionItem;
+
+      if (!isNaN(itemIndex) && newState.items[itemIndex]) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const item = newState.items[itemIndex] as any;
+        if (op.op === 'replace' || op.op === 'add') {
+          item[field] = op.value;
+        } else if (op.op === 'remove') {
+          delete item[field];
+        }
+      }
+    }
+  }
+
+  return newState;
+}
+
+/**
  * Handle an AG-UI event with context actions.
  * Processes streaming events and executes frontend tools when needed.
  *
@@ -440,7 +595,9 @@ async function handleEventWithContext(
   setCurrentText: (text: string) => void,
   setCurrentMessageId: (id: string | null) => void,
   setMessages: (messages: Message[]) => void,
-  currentMessages: Message[]
+  currentMessages: Message[],
+  toolExecutionState: ToolExecutionState | null,
+  setToolExecutionState: (state: ToolExecutionState | null) => void
 ): Promise<EventHandlerResult> {
   switch (event.type) {
     case EventType.RUN_STARTED:
@@ -510,6 +667,13 @@ async function handleEventWithContext(
     case EventType.TOOL_CALL_END: {
       if (!event.toolCallId) break;
       const toolCall = toolCalls[event.toolCallId];
+
+      // Guard against missing toolCall (shouldn't happen, but be defensive)
+      if (!toolCall) {
+        console.warn('[AG-UI] TOOL_CALL_END received for unknown toolCallId:', event.toolCallId);
+        console.warn('[AG-UI] Known toolCalls:', Object.keys(toolCalls));
+        break;
+      }
 
       // For todo_write, update existing todo list or create new one
       // This ensures a single, evolving todo list throughout the conversation
@@ -689,15 +853,26 @@ async function handleEventWithContext(
       break;
 
     // State management events (AG-UI protocol compliance)
-    case EventType.STATE_SNAPSHOT:
+    case EventType.STATE_SNAPSHOT: {
       console.log('[AG-UI] State snapshot received:', event.state);
-      // Could emit to context or state management system
+      // Extract toolExecutions from the state snapshot
+      const state = event.state as { toolExecutions?: ToolExecutionState } | undefined;
+      if (state?.toolExecutions) {
+        console.log('[AG-UI] Tool execution state received:', state.toolExecutions);
+        setToolExecutionState(state.toolExecutions);
+      }
       break;
+    }
 
-    case EventType.STATE_DELTA:
+    case EventType.STATE_DELTA: {
       console.log('[AG-UI] State delta received:', event.operations);
-      // Apply JSON Patch operations to state
+      // Apply JSON Patch operations to toolExecutionState
+      if (toolExecutionState && event.operations) {
+        const newState = applyJsonPatch(toolExecutionState, event.operations);
+        setToolExecutionState(newState);
+      }
       break;
+    }
 
     case EventType.MESSAGES_SNAPSHOT:
       console.log('[AG-UI] Messages snapshot received:', event.messages);

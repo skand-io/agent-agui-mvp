@@ -82,6 +82,48 @@ export interface TodoItem {
   status: TodoStatus;
 }
 
+// =============================================================================
+// Tool Execution State Types (PostHog Pattern)
+// =============================================================================
+
+/** Valid statuses for tool execution tracking */
+export type ToolExecutionStatus = 'pending' | 'executing' | 'completed' | 'failed';
+
+/** Type of tool - frontend or backend */
+export type ToolType = 'frontend' | 'backend';
+
+/** System-level tracking for a single tool call */
+export interface ToolExecutionItem {
+  /** Unique tool call ID */
+  id: string;
+  /** Tool name */
+  name: string;
+  /** JSON-encoded arguments */
+  arguments: string;
+  /** Frontend or backend tool */
+  tool_type: ToolType;
+  /** Current execution status */
+  status: ToolExecutionStatus;
+  /** Execution result (if completed) */
+  result?: string;
+  /** Error message (if failed) */
+  error?: string;
+  /** Start timestamp in milliseconds */
+  started_at?: number;
+  /** Completion timestamp in milliseconds */
+  completed_at?: number;
+}
+
+/** Full execution state for a run */
+export interface ToolExecutionState {
+  /** Run ID this state belongs to */
+  run_id: string;
+  /** Tool execution items */
+  items: ToolExecutionItem[];
+  /** Creation timestamp in milliseconds */
+  created_at: number;
+}
+
 /** JSON Schema property definition */
 export interface ToolParameterProperty {
   /** JSON Schema type */
