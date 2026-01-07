@@ -12,7 +12,7 @@ import json
 import os
 import uuid
 from collections.abc import AsyncGenerator
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -25,7 +25,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, Send, interrupt
+import pprint
 
 from ag_ui.core import (
     CustomEvent,
@@ -49,6 +50,17 @@ from ag_ui.encoder import EventEncoder
 
 from tracing import tracer
 
+
+def log_message(msg: BaseMessage, label: str = "MESSAGE") -> None:
+    """Log message content, tool_calls, and type for debugging."""
+    tracer.log_event(label, f"type={type(msg).__name__}")
+    tracer.log_event(label, f"content={pprint.pformat(msg.content)}")
+    try:
+        tracer.log_event(label, f"tool_calls={pprint.pformat(msg.tool_calls)}")
+    except Exception:
+        pass
+
+
 # Load environment variables
 load_dotenv()
 
@@ -69,10 +81,16 @@ encoder = EventEncoder()
 
 
 # ============= AGENT STATE =============
-class AgentState(dict):
+def _last_value(left: str | None, right: str | None) -> str | None:
+    """Reducer that takes the last (rightmost) value. Used for parallel Send() merging."""
+    return right
+
+
+class AgentState(TypedDict):
     """State for the LangGraph agent."""
 
     messages: Annotated[list[BaseMessage], add_messages]
+    root_tool_call_id: Annotated[str | None, _last_value]  # Identifies which specific tool call to process
 
 
 # ============= TOOL DEFINITIONS =============
@@ -134,6 +152,9 @@ model = ChatOpenAI(
 def call_model(state: AgentState) -> dict:
     """LLM agent node - calls the model and returns the response."""
     tracer.log_event("CALL_MODEL_START")
+    tracer.log_event("STATE MESSAGES")
+    for msg in state["messages"]:
+        log_message(msg)
     with tracer.trace("agent", state=state):
         tracer.log_event("LLM_INVOKE", f"model={MODEL}")
         response = model.invoke(state["messages"])
@@ -150,101 +171,176 @@ def call_model(state: AgentState) -> dict:
         return result
 
 
-def route_tools(state: AgentState) -> Literal["frontend_handler", "backend_handler", "end"]:
-    """Route based on tool type in the last message."""
+def route_tools(state: AgentState) -> list[Send] | Literal["end"]:
+    """Route tools ONE AT A TIME in LLM-specified order for true sequential execution."""
     tracer.log_event("ROUTE_TOOLS_START")
-    with tracer.trace("route_tools", state=state):
-        last_message = state["messages"][-1]
+    last_message = state["messages"][-1]
 
-        if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
-            tracer.log_routing("end", "no tool calls")
-            return "end"
+    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
+        tracer.log_routing("end", "no tool calls")
+        return "end"
 
-        # Get FIRST tool call only (sequential execution)
-        tool_call = last_message.tool_calls[0]
-        tool_name = tool_call["name"]
+    # Find tool_call_ids that already have ToolMessage results (from previous execution)
+    processed_tool_ids = {
+        msg.tool_call_id
+        for msg in state["messages"]
+        if isinstance(msg, ToolMessage)
+    }
 
-        if tool_name in FRONTEND_TOOLS:
-            tracer.log_routing("frontend_handler", f"tool={tool_name} is frontend")
-            return "frontend_handler"
+    # Find the FIRST unprocessed tool call (preserves LLM order)
+    next_tool = None
+    for tc in last_message.tool_calls:
+        if tc["id"] not in processed_tool_ids:
+            next_tool = tc
+            break
 
-        tracer.log_routing("backend_handler", f"tool={tool_name} is backend")
-        return "backend_handler"
+    if not next_tool:
+        tracer.log_routing("end", "all tools already processed")
+        return "end"
+
+    tracer.log_routing("tool_handler", f"tool={next_tool['name']} (sequential)")
+
+    # Return ONLY ONE Send() for the next tool
+    return [Send("tool_handler", {**state, "root_tool_call_id": next_tool["id"]})]
 
 
-def frontend_handler(state: AgentState) -> dict:
-    """Pause for frontend tool execution using interrupt()."""
-    tracer.log_event("FRONTEND_HANDLER_START")
-    with tracer.trace("frontend_handler", state=state):
-        last_message = state["messages"][-1]
-        tool_call = last_message.tool_calls[0]
+def route_after_tool(state: AgentState) -> list[Send] | Literal["agent"]:
+    """After tool_handler completes, check if more tools need processing."""
+    tracer.log_event("ROUTE_AFTER_TOOL_START")
 
-        tracer.log_event("INTERRUPT", f"tool={tool_call['name']} args={tool_call['args']}")
+    # Find the last AIMessage with tool_calls
+    last_ai_message = None
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            last_ai_message = msg
+            break
 
-        # INTERRUPT: Pause execution and wait for frontend
-        # The value we pass here is sent to the client
-        frontend_result = interrupt(
-            {
-                "type": "frontend_tool_call",
-                "tool_call_id": tool_call["id"],
-                "tool_name": tool_call["name"],
-                "args": tool_call["args"],
-            }
+    if not last_ai_message:
+        tracer.log_routing("agent", "no AI message with tools")
+        return "agent"
+
+    # Find tool_call_ids that already have ToolMessage results
+    processed_tool_ids = {
+        msg.tool_call_id
+        for msg in state["messages"]
+        if isinstance(msg, ToolMessage)
+    }
+
+    # Find the FIRST unprocessed tool call
+    next_tool = None
+    for tc in last_ai_message.tool_calls:
+        if tc["id"] not in processed_tool_ids:
+            next_tool = tc
+            break
+
+    if not next_tool:
+        tracer.log_routing("agent", "all tools processed - getting final response")
+        return "agent"
+
+    tracer.log_routing("tool_handler", f"next tool={next_tool['name']}")
+    return [Send("tool_handler", {**state, "root_tool_call_id": next_tool["id"]})]
+
+
+async def tool_handler(state: AgentState) -> dict:
+    """
+    Process ONE tool call identified by root_tool_call_id.
+
+    - Frontend tools: use interrupt() to pause for client execution
+    - Backend tools: execute immediately and return result
+    """
+    tracer.log_event("TOOL_HANDLER_START")
+    with tracer.trace("tool_handler", state=state):
+        tool_call_id = state.get("root_tool_call_id")
+        tracer.log_event("TOOL_CALL_ID", f"tool_call_id={tool_call_id}")
+
+        # Guard: ensure we have a tool call ID
+        if not tool_call_id:
+            tracer.log_event("NO_TOOL_CALL_ID", "missing root_tool_call_id")
+            return {"root_tool_call_id": None}
+
+        # Find the AIMessage with tool_calls (may not be the last message after looping)
+        ai_message = None
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                ai_message = msg
+                break
+
+        if not ai_message:
+            tracer.log_event("NO_AI_MESSAGE", "no AIMessage with tool_calls found")
+            return {"root_tool_call_id": None}
+
+        log_message(ai_message, "AI_MESSAGE")
+
+        # Find the specific tool call we're responsible for
+        tool_call = next(
+            (tc for tc in ai_message.tool_calls or [] if tc["id"] == tool_call_id),
+            None,
         )
 
-        tracer.log_event("RESUME", f"result={str(frontend_result)[:100]}")
+        if not tool_call:
+            tracer.log_event("TOOL_NOT_FOUND", f"id={tool_call_id}")
+            return {"root_tool_call_id": None}
 
-        # When resumed with Command(resume="..."), frontend_result contains that value
-        result = {"messages": [ToolMessage(content=str(frontend_result), tool_call_id=tool_call["id"])]}
-        tracer.log_output("frontend_handler", result)
-        return result
+        tool_name = tool_call["name"]
 
+        # === FRONTEND TOOL: Use interrupt() ===
+        if tool_name in FRONTEND_TOOLS:
+            tracer.log_event("FRONTEND_TOOL", f"tool={tool_name} - interrupting")
 
-async def backend_handler(state: AgentState) -> dict:
-    """Execute backend tools immediately, skipping any frontend tools."""
-    with tracer.trace("backend_handler", state=state):
-        last_message = state["messages"][-1]
-        results = []
+            # Interrupt execution, pass tool call info to client
+            frontend_result = interrupt({
+                "type": "frontend_tool_call",
+                "tool_call_id": tool_call["id"],
+                "tool_name": tool_name,
+                "args": tool_call["args"],
+            })
 
-        for tool_call in last_message.tool_calls:
-            tool_name = tool_call["name"]
+            tracer.log_event("RESUME", f"result={str(frontend_result)[:100]}")
 
-            # Skip frontend tools - they will be handled by frontend_handler
-            if tool_name in FRONTEND_TOOLS:
-                tracer.log_event("SKIP_FRONTEND_TOOL", f"tool={tool_name} (will be handled by frontend)")
-                continue
+            return {
+                "messages": [ToolMessage(content=str(frontend_result), tool_call_id=tool_call["id"])],
+                "root_tool_call_id": None,
+            }
 
-            handler = BACKEND_TOOL_HANDLERS.get(tool_name)
-            if handler:
-                tracer.log_event("BACKEND_TOOL_EXECUTE", f"tool={tool_name} args={tool_call['args']}")
-                result = await handler(**tool_call["args"])
-                tracer.log_event("BACKEND_TOOL_RESULT", f"tool={tool_name} result={str(result)[:100]}")
-                results.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
+        # === BACKEND TOOL: Execute immediately ===
+        handler = BACKEND_TOOL_HANDLERS.get(tool_name)
+        if handler:
+            tracer.log_event("BACKEND_TOOL", f"tool={tool_name} - executing")
+            result = await handler(**tool_call["args"])
+            tracer.log_event("BACKEND_TOOL_RESULT", f"result={str(result)[:100]}")
 
-        output = {"messages": results}
-        tracer.log_output("backend_handler", output)
-        return output
+            return {
+                "messages": [ToolMessage(content=result, tool_call_id=tool_call["id"])],
+                "root_tool_call_id": None,
+            }
+
+        # Unknown tool
+        tracer.log_event("UNKNOWN_TOOL", f"tool={tool_name}")
+        return {
+            "messages": [ToolMessage(content=f"Unknown tool: {tool_name}", tool_call_id=tool_call["id"])],
+            "root_tool_call_id": None,
+        }
 
 
 # ============= BUILD GRAPH =============
 workflow = StateGraph(AgentState)
 
+# Nodes
 workflow.add_node("agent", call_model)
-workflow.add_node("frontend_handler", frontend_handler)
-workflow.add_node("backend_handler", backend_handler)
+workflow.add_node("tool_handler", tool_handler)  # Unified handler for all tools
 
+# Edges
 workflow.add_edge(START, "agent")
 workflow.add_conditional_edges(
     "agent",
     route_tools,
-    {
-        "frontend_handler": "frontend_handler",
-        "backend_handler": "backend_handler",
-        "end": END,
-    },
+    {"end": END},  # Send() targets are resolved dynamically
 )
-workflow.add_edge("frontend_handler", "agent")  # Loop back after frontend result
-workflow.add_edge("backend_handler", "agent")  # Loop back after backend result
+workflow.add_conditional_edges(
+    "tool_handler",
+    route_after_tool,
+    {"agent": "agent"},  # Send() targets resolved dynamically
+)
 
 # CRITICAL: Checkpointer required for interrupt() to work
 memory = InMemorySaver()
@@ -289,14 +385,27 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             # Determine input
             if request.resume_value:
                 # Resuming after frontend tool
+                tracer.log_agui("GRAPH_RESUME", f"resume={request.resume_value}")
                 input_data = Command(resume=request.resume_value)
             else:
                 # New message
                 input_data = {"messages": [HumanMessage(content=request.message)]}
 
             message_id = str(uuid.uuid4())
-            tool_log_idx = 0
+            tool_call_id_to_idx: dict[str, int] = {}  # Map tool_call_id to tool_logs index
+            next_tool_log_idx = 0
             interrupted = False
+
+            # Rebuild tool_call_id_to_idx mapping on resume (it resets to {} each request)
+            if request.resume_value:
+                graph_state = graph.get_state(config)
+                if graph_state and graph_state.values:
+                    for msg in graph_state.values.get("messages", []):
+                        if isinstance(msg, AIMessage) and msg.tool_calls:
+                            for idx, tc in enumerate(msg.tool_calls):
+                                tool_call_id_to_idx[tc["id"]] = idx
+                                next_tool_log_idx = max(next_tool_log_idx, idx + 1)
+                tracer.log_event("MAPPING_REBUILT", f"tool_call_id_to_idx={list(tool_call_id_to_idx.keys())}")
 
             tracer.log_event("GRAPH_START", f"thread={thread_id[:8]}... resume={bool(request.resume_value)}")
 
@@ -365,22 +474,17 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                         ]
                                     )
                                 )
-                                tool_log_idx += 1
+                                # Track tool_call_id -> index mapping for updates
+                                tool_call_id_to_idx[tc["id"]] = next_tool_log_idx
+                                next_tool_log_idx += 1
 
                             # End text message after tool calls
                             if msg.content:
                                 tracer.log_agui("TEXT_MESSAGE_END", f"id={message_id[:8]}...")
                                 yield encoder.encode(TextMessageEndEvent(message_id=message_id))
 
-                elif node_name == "frontend_handler":
-                    # Frontend tool was processed - this means we're returning from interrupt
-                    # The tool was executed by the frontend
-                    # Note: We don't update tool_logs here because the frontend already
-                    # knows about the tool and its completion from the resume flow
-                    pass
-
-                elif node_name == "backend_handler":
-                    # Backend tool results
+                elif node_name == "tool_handler":
+                    # Tool handler processed a tool (backend or resumed frontend)
                     for msg in node_output.get("messages", []):
                         if isinstance(msg, ToolMessage):
                             tracer.log_agui("TOOL_CALL_RESULT", f"id={msg.tool_call_id[:8]}... content={str(msg.content)[:50]}")
@@ -392,24 +496,26 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                     role="tool",
                                 )
                             )
-                            # Update tool_log status
-                            tracer.log_agui("STATE_DELTA", f"replace /tool_logs/{tool_log_idx - 1}/status=completed")
-                            yield encoder.encode(
-                                StateDeltaEvent(
-                                    delta=[
-                                        {
-                                            "op": "replace",
-                                            "path": f"/tool_logs/{tool_log_idx - 1}/status",
-                                            "value": "completed",
-                                        },
-                                        {
-                                            "op": "replace",
-                                            "path": f"/tool_logs/{tool_log_idx - 1}/message",
-                                            "value": f"Completed: {msg.content}",
-                                        },
-                                    ]
+                            # Update tool_log status using tool_call_id mapping
+                            tool_idx = tool_call_id_to_idx.get(msg.tool_call_id)
+                            if tool_idx is not None:
+                                tracer.log_agui("STATE_DELTA", f"replace /tool_logs/{tool_idx}/status=completed")
+                                yield encoder.encode(
+                                    StateDeltaEvent(
+                                        delta=[
+                                            {
+                                                "op": "replace",
+                                                "path": f"/tool_logs/{tool_idx}/status",
+                                                "value": "completed",
+                                            },
+                                            {
+                                                "op": "replace",
+                                                "path": f"/tool_logs/{tool_idx}/message",
+                                                "value": f"Completed: {msg.content}",
+                                            },
+                                        ]
+                                    )
                                 )
-                            )
 
                 elif node_name == "__interrupt__":
                     tracer.log_event("INTERRUPT", "graph paused - frontend tool needed")
@@ -435,14 +541,16 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     )
 
                     # Update tool_log to show awaiting frontend
-                    if tool_log_idx > 0:
-                        tracer.log_agui("STATE_DELTA", f"replace /tool_logs/{tool_log_idx - 1}/message=awaiting")
+                    frontend_tool_call_id = interrupt_data.get("tool_call_id") if isinstance(interrupt_data, dict) else None
+                    frontend_tool_idx = tool_call_id_to_idx.get(frontend_tool_call_id) if frontend_tool_call_id else None
+                    if frontend_tool_idx is not None:
+                        tracer.log_agui("STATE_DELTA", f"replace /tool_logs/{frontend_tool_idx}/message=awaiting")
                         yield encoder.encode(
                             StateDeltaEvent(
                                 delta=[
                                     {
                                         "op": "replace",
-                                        "path": f"/tool_logs/{tool_log_idx - 1}/message",
+                                        "path": f"/tool_logs/{frontend_tool_idx}/message",
                                         "value": "Awaiting frontend execution...",
                                     },
                                 ]

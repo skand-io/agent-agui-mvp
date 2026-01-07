@@ -4,8 +4,8 @@
  */
 
 import { useState } from 'react';
-import { useChat } from './useChat';
 import './App.css';
+import { useChat } from './useChat';
 
 export default function App() {
   const { messages, isLoading, sendMessage, agentState, activity } = useChat();
@@ -44,7 +44,7 @@ export default function App() {
             <div className="message-content">
               {'content' in msg && typeof msg.content === 'string' && msg.content}
 
-              {/* Display tool calls from assistant messages */}
+              {/* Display tool calls from assistant messages
               {msg.role === 'assistant' && 'toolCalls' in msg && msg.toolCalls && msg.toolCalls.length > 0 && (
                 <div className="tool-calls">
                   {msg.toolCalls.map((tc) => (
@@ -57,7 +57,7 @@ export default function App() {
                     </div>
                   ))}
                 </div>
-              )}
+              )} */}
             </div>
           </div>
         ))}

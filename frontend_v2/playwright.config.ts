@@ -35,7 +35,7 @@ export default defineConfig({
       timeout: 30000,
     },
     {
-      command: 'cd ../backend && uv run python server.py',
+      command: 'cd ../backend_v2 && uv run python server_langgraph.py',
       url: 'http://localhost:8000/health',
       reuseExistingServer: !process.env.CI,
       timeout: 30000,

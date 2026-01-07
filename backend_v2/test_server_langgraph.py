@@ -1,35 +1,37 @@
 """
-Test for LangGraph-based AG-UI Backend.
+Test for LangGraph-based AG-UI Backend with PostHog-style Send() pattern.
 
-Tests mixed tool calls (backend + frontend) to ensure proper sequential routing.
+Tests that each tool call is processed individually via Send(), with:
+- Backend tools executing immediately (one per Send)
+- Frontend tools triggering interrupt
 """
 
 import json
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 
-class TestSequentialToolRouting:
-    """Test that sequential tool calls are routed correctly: BE, BE, FE, BE, FE."""
+class TestSendPatternToolRouting:
+    """Test the PostHog-style Send() pattern for tool routing."""
 
     @pytest.mark.asyncio
-    async def test_sequential_tool_routing(self):
+    async def test_mixed_tools_be_be_fe_be_fe(self):
         """
         E2E test: LLM returns [BE, BE, FE, BE, FE] tool calls.
 
-        Simulates realistic flow:
-        1. First LLM call returns all 5 tools
-        2. Backend tools (BE1, BE2, BE3) are processed
-        3. Agent loops back, second LLM call returns FE1 (model sees BE results)
-        4. FE1 triggers interrupt
+        With sequential execution:
+        1. Tools execute one at a time in order
+        2. BE1 executes → BE2 executes → FE1 triggers interrupt
+        3. BE3 and FE2 are NOT reached (paused waiting for frontend)
+        4. No errors occur
         """
         from fastapi.testclient import TestClient
         from server_langgraph import app
 
-        # First LLM response: returns all 5 tool calls
-        first_response = AIMessage(
+        # LLM returns 5 tool calls: BE, BE, FE, BE, FE
+        mock_response = AIMessage(
             content="",
             tool_calls=[
                 {"id": "be_1", "name": "get_weather", "args": {"city": "Tokyo"}},
@@ -40,25 +42,8 @@ class TestSequentialToolRouting:
             ],
         )
 
-        # Second LLM response: after seeing backend results, calls frontend tool
-        second_response = AIMessage(
-            content="",
-            tool_calls=[
-                {"id": "fe_1", "name": "greet", "args": {"name": "Alice"}},
-            ],
-        )
-
-        call_count = 0
-
-        def mock_invoke(messages):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return first_response
-            return second_response
-
         with patch("server_langgraph.model") as mock_model:
-            mock_model.invoke.side_effect = mock_invoke
+            mock_model.invoke.return_value = mock_response
 
             client = TestClient(app)
             response = client.post(
@@ -81,22 +66,21 @@ class TestSequentialToolRouting:
             error_events = [e for e in events if e.get("type") == "CUSTOM" and e.get("name") == "error"]
             assert len(error_events) == 0, f"Got error events: {error_events}"
 
-            # Verify tool calls were started (5 from first response + 1 from second)
+            # Verify all 5 tool calls were started
             tool_call_starts = [e for e in events if e.get("type") == "TOOL_CALL_START"]
-            assert len(tool_call_starts) == 6, f"Expected 6 tool calls, got {len(tool_call_starts)}: {[e.get('toolCallId') for e in tool_call_starts]}"
+            assert len(tool_call_starts) == 5, f"Expected 5 tool calls, got {len(tool_call_starts)}"
 
-            # First 5 should be from initial response
-            first_five = tool_call_starts[:5]
-            first_five_ids = [e.get("toolCallId") for e in first_five]
-            assert first_five_ids == ["be_1", "be_2", "fe_1", "be_3", "fe_2"], f"Wrong initial order: {first_five_ids}"
+            # Verify tool call order matches: be_1, be_2, fe_1, be_3, fe_2
+            tool_ids = [e.get("toolCallId") for e in tool_call_starts]
+            assert tool_ids == ["be_1", "be_2", "fe_1", "be_3", "fe_2"], f"Wrong order: {tool_ids}"
 
-            # Verify all 3 backend tools got results
+            # With sequential execution, only 2 backend tools complete before FE1 interrupt
             tool_results = [e for e in events if e.get("type") == "TOOL_CALL_RESULT"]
-            assert len(tool_results) == 3, f"Expected 3 backend results, got {len(tool_results)}"
+            assert len(tool_results) == 2, f"Expected 2 backend results before interrupt, got {len(tool_results)}"
 
-            # Verify backend results are for the correct tools
+            # Verify backend results are for BE1 and BE2 (in order, before FE1)
             result_tool_ids = [e.get("toolCallId") for e in tool_results]
-            assert set(result_tool_ids) == {"be_1", "be_2", "be_3"}, f"Wrong backend tools: {result_tool_ids}"
+            assert result_tool_ids == ["be_1", "be_2"], f"Wrong backend tools or order: {result_tool_ids}"
 
             # Verify frontend tool triggered interrupt
             interrupt_events = [
@@ -105,8 +89,10 @@ class TestSequentialToolRouting:
             ]
             assert len(interrupt_events) > 0, "Expected interrupt for frontend tool"
 
-            # Verify the model was called twice (initial + after backend results)
-            assert call_count == 2, f"Expected 2 model calls, got {call_count}"
+            # Verify the interrupt is for fe_1 (the first frontend tool)
+            fe_required = [e for e in events if e.get("type") == "CUSTOM" and e.get("name") == "frontend_tool_required"]
+            assert len(fe_required) > 0, "Expected frontend_tool_required event"
+            assert fe_required[0].get("value", {}).get("tool_call_id") == "fe_1"
 
 
 if __name__ == "__main__":

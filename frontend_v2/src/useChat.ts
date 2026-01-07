@@ -53,6 +53,7 @@ export function useChat() {
    * Handle a single AG-UI event
    */
   const handleEvent = useCallback(async (event: any) => {
+    console.log('🔍 handleEvent:', event);
     switch (event.type) {
       // === LIFECYCLE ===
       case EventType.RUN_STARTED:
@@ -121,7 +122,9 @@ export function useChat() {
       case EventType.TEXT_MESSAGE_CONTENT:
         console.log('💬 TEXT_MESSAGE_CONTENT:', event.delta);
         if (currentMessage.current) {
+          // update the current message content
           currentMessage.current.content = (currentMessage.current.content || '') + event.delta;
+
           // Capture ref value to avoid null access in async callback
           const message = currentMessage.current;
           // Update message in real-time
@@ -193,16 +196,27 @@ export function useChat() {
 
       case EventType.TOOL_CALL_RESULT:
         console.log('🔧 TOOL_CALL_RESULT:', event.content);
-        // Add tool result message
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: event.messageId || event.message_id,
-            role: 'tool',
-            toolCallId: event.toolCallId || event.tool_call_id,
-            content: event.content,
-          },
-        ]);
+        // Add tool result message (deduplicate by toolCallId)
+        setMessages((prev) => {
+          const toolCallId = event.toolCallId || event.tool_call_id;
+          // Skip if we already have a result for this tool call
+          const existingResult = prev.find(
+            (m) => m.role === 'tool' && (m as any).toolCallId === toolCallId
+          );
+          if (existingResult) {
+            console.log('🔧 Skipping duplicate TOOL_CALL_RESULT:', toolCallId);
+            return prev;
+          }
+          return [
+            ...prev,
+            {
+              id: event.messageId || event.message_id,
+              role: 'tool',
+              toolCallId,
+              content: event.content,
+            },
+          ];
+        });
         break;
 
       // === ACTIVITY TRACKING ===
