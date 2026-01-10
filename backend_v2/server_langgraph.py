@@ -49,15 +49,18 @@ from ag_ui.core import (
 from ag_ui.encoder import EventEncoder
 
 from tracing import tracer
+from tools import FRONTEND_TOOLS, BACKEND_TOOLS, TOOLS, BACKEND_TOOL_HANDLERS
 
 
 def log_message(msg: BaseMessage, label: str = "MESSAGE") -> None:
     """Log message content, tool_calls, and type for debugging."""
-    tracer.log_event(label, f"type={type(msg).__name__}")
-    tracer.log_event(label, f"content={pprint.pformat(msg.content)}")
+    tracer.log_event(label, f"  type={type(msg).__name__}")
+    tracer.log_event(label, f"  content={pprint.pformat(msg.content)}")
+    # tracer.log_event(label, f"  message={pprint.pformat(msg)}")
     try:
-        tracer.log_event(label, f"tool_calls={pprint.pformat(msg.tool_calls)}")
+        tracer.log_event(label, f"  tool_calls={pprint.pformat(msg.tool_calls)}")
     except Exception:
+        # tracer.log_event(f"Exception for message {msg}")
         pass
 
 
@@ -93,49 +96,6 @@ class AgentState(TypedDict):
     root_tool_call_id: Annotated[str | None, _last_value]  # Identifies which specific tool call to process
 
 
-# ============= TOOL DEFINITIONS =============
-FRONTEND_TOOLS = {"greet"}
-BACKEND_TOOLS = {"get_weather"}
-
-
-async def get_weather(city: str) -> str:
-    """Backend tool - get weather for a city."""
-    await asyncio.sleep(0.5)  # Simulate API call
-    return f"Weather in {city}: 22°C, Sunny"
-
-
-BACKEND_TOOL_HANDLERS = {
-    "get_weather": get_weather,
-}
-
-# Tool definitions for LLM
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "greet",
-            "description": "Greet a person by name (shows browser alert)",
-            "parameters": {
-                "type": "object",
-                "properties": {"name": {"type": "string", "description": "The person's name"}},
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get current weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string", "description": "The city name"}},
-                "required": ["city"],
-            },
-        },
-    },
-]
-
 # ============= MODEL =============
 MODEL = os.getenv("MODEL", "amazon/nova-2-lite-v1:free")
 print(f"MODEL: {MODEL}")
@@ -152,7 +112,7 @@ model = ChatOpenAI(
 def call_model(state: AgentState) -> dict:
     """LLM agent node - calls the model and returns the response."""
     tracer.log_event("CALL_MODEL_START")
-    tracer.log_event("STATE MESSAGES")
+    tracer.log_event(f"NUMBER OF EXISTING MESSAGES {len(state['messages'])}")
     for msg in state["messages"]:
         log_message(msg)
     with tracer.trace("agent", state=state):
