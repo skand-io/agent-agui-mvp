@@ -28,9 +28,29 @@ from langgraph.graph.message import add_messages
 from langgraph.types import Command, Send, interrupt
 import pprint
 
+# Patch langchain-openai to preserve reasoning_content from OpenRouter/DeepSeek.
+# ChatOpenAI explicitly drops non-standard fields like reasoning_content.
+# This patch captures it into additional_kwargs so we can emit real THINKING events.
+import langchain_openai.chat_models.base as _lc_oai_base
+
+_original_convert_dict_to_message = _lc_oai_base._convert_dict_to_message
+
+
+def _convert_dict_to_message_with_reasoning(_dict: dict, *args, **kwargs):  # type: ignore[no-untyped-def]
+    msg = _original_convert_dict_to_message(_dict, *args, **kwargs)
+    if isinstance(msg, AIMessage) and _dict.get("reasoning_content"):
+        msg.additional_kwargs["reasoning_content"] = _dict["reasoning_content"]
+    return msg
+
+
+_lc_oai_base._convert_dict_to_message = _convert_dict_to_message_with_reasoning
+
 from ag_ui.core import (
+    ActivityDeltaEvent,
+    ActivitySnapshotEvent,
     CustomEvent,
     MessagesSnapshotEvent,
+    RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
     StateDeltaEvent,
@@ -40,6 +60,11 @@ from ag_ui.core import (
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
+    ThinkingEndEvent,
+    ThinkingStartEvent,
+    ThinkingTextMessageContentEvent,
+    ThinkingTextMessageEndEvent,
+    ThinkingTextMessageStartEvent,
     ToolCallArgsEvent,
     ToolCallEndEvent,
     ToolCallResultEvent,
@@ -97,14 +122,19 @@ class AgentState(TypedDict):
 
 
 # ============= MODEL =============
-MODEL = os.getenv("MODEL", "amazon/nova-2-lite-v1:free")
+# Use a model that supports both tool calling AND reasoning.
+# deepseek/deepseek-v3.2 unifies reasoning with agentic tool use.
+# Enable reasoning via OpenRouter's reasoning parameter.
+MODEL = os.getenv("MODEL", "deepseek/deepseek-v3.2")
 print(f"MODEL: {MODEL}")
 
-# Using ChatOpenAI with OpenRouter base URL
+# Using ChatOpenAI with OpenRouter base URL.
+# extra_body passes OpenRouter's reasoning parameter to request thinking tokens.
 model = ChatOpenAI(
     model=MODEL,
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
+    extra_body={"reasoning": {"effort": "high"}},
 ).bind_tools(TOOLS)
 
 
@@ -309,9 +339,50 @@ graph = workflow.compile(checkpointer=memory)
 
 # ============= REQUEST/RESPONSE MODELS =============
 class ChatRequest(BaseModel):
-    message: str
+    """Accepts both RunAgentInput format and legacy format."""
+
+    # RunAgentInput fields
     thread_id: str | None = None
-    resume_value: str | None = None  # Value to resume with after frontend tool
+    run_id: str | None = None
+    messages: list[dict] | None = None  # RunAgentInput messages array
+    tools: list[dict] | None = None
+    context: list[dict] | None = None
+
+    # Legacy fields
+    message: str | None = None
+
+    @property
+    def is_run_agent_input(self) -> bool:
+        """Detect RunAgentInput format by presence of messages array."""
+        return self.messages is not None
+
+    @property
+    def is_resume(self) -> bool:
+        """Detect resume: RunAgentInput with ToolMessage in messages + existing thread."""
+        if not self.is_run_agent_input or not self.messages:
+            return False
+        return any(m.get("role") == "tool" for m in self.messages)
+
+    @property
+    def user_message(self) -> str:
+        """Extract user message from either format."""
+        if self.is_run_agent_input and self.messages:
+            # Find the last user message
+            for msg in reversed(self.messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    return content if isinstance(content, str) else str(content)
+        return self.message or ""
+
+    @property
+    def resume_tool_message(self) -> dict | None:
+        """Extract ToolMessage from messages array for resume."""
+        if not self.is_run_agent_input or not self.messages:
+            return None
+        for msg in reversed(self.messages):
+            if msg.get("role") == "tool":
+                return msg
+        return None
 
 
 # ============= CHAT ENDPOINT =============
@@ -319,45 +390,50 @@ class ChatRequest(BaseModel):
 async def chat(request: ChatRequest) -> StreamingResponse:
     """Handle chat requests with SSE streaming of AG-UI events."""
     thread_id = request.thread_id or str(uuid.uuid4())
+    run_id = request.run_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
 
     async def generate() -> AsyncGenerator[str, None]:
-        run_id = str(uuid.uuid4())
-
         # Lifecycle start
         tracer.log_agui("RUN_STARTED", f"thread={thread_id[:8]}... run={run_id[:8]}...")
         yield encoder.encode(RunStartedEvent(thread_id=thread_id, run_id=run_id))
 
+        is_resume = request.is_resume
+
         # Only send STATE_SNAPSHOT and MESSAGES_SNAPSHOT for new requests, not resumes
-        if not request.resume_value:
+        if not is_resume:
             tracer.log_agui("STATE_SNAPSHOT", "tool_logs=[]")
             yield encoder.encode(StateSnapshotEvent(snapshot={"tool_logs": []}))
             messages: list[Message] = [
-                {"id": str(uuid.uuid4()), "role": "user", "content": request.message}
+                {"id": str(uuid.uuid4()), "role": "user", "content": request.user_message}
             ]
             tracer.log_agui("MESSAGES_SNAPSHOT", f"count={len(messages)}")
             yield encoder.encode(MessagesSnapshotEvent(messages=messages))
+
+        # Emit model metadata as CUSTOM event
+        tracer.log_agui("CUSTOM", f"model_info model={MODEL}")
+        yield encoder.encode(CustomEvent(name="model_info", value={"model": MODEL}))
 
         tracer.log_agui("STEP_STARTED", "langgraph_execution")
         yield encoder.encode(StepStartedEvent(step_name="langgraph_execution"))
 
         try:
             # Determine input
-            if request.resume_value:
-                # Resuming after frontend tool
-                tracer.log_agui("GRAPH_RESUME", f"resume={request.resume_value}")
-                input_data = Command(resume=request.resume_value)
+            if is_resume:
+                tool_msg = request.resume_tool_message
+                resume_content = tool_msg.get("content", "") if tool_msg else ""
+                tracer.log_agui("GRAPH_RESUME", f"resume={resume_content}")
+                input_data = Command(resume=resume_content)
             else:
-                # New message
-                input_data = {"messages": [HumanMessage(content=request.message)]}
+                input_data = {"messages": [HumanMessage(content=request.user_message)]}
 
             message_id = str(uuid.uuid4())
-            tool_call_id_to_idx: dict[str, int] = {}  # Map tool_call_id to tool_logs index
+            activity_message_id = str(uuid.uuid4())
+            tool_call_id_to_idx: dict[str, int] = {}
             next_tool_log_idx = 0
-            interrupted = False
 
-            # Rebuild tool_call_id_to_idx mapping on resume (it resets to {} each request)
-            if request.resume_value:
+            # Rebuild tool_call_id_to_idx mapping on resume
+            if is_resume:
                 graph_state = graph.get_state(config)
                 if graph_state and graph_state.values:
                     for msg in graph_state.values.get("messages", []):
@@ -367,7 +443,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                 next_tool_log_idx = max(next_tool_log_idx, idx + 1)
                 tracer.log_event("MAPPING_REBUILT", f"tool_call_id_to_idx={list(tool_call_id_to_idx.keys())}")
 
-            tracer.log_event("GRAPH_START", f"thread={thread_id[:8]}... resume={bool(request.resume_value)}")
+            tracer.log_event("GRAPH_START", f"thread={thread_id[:8]}... resume={is_resume}")
 
             # Stream graph execution (async)
             async for event in graph.astream(input_data, config, stream_mode="updates"):
@@ -380,13 +456,30 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     # Agent produced a message
                     for msg in node_output.get("messages", []):
                         if isinstance(msg, AIMessage):
+                            # Emit THINKING events if model returned reasoning tokens
+                            reasoning = msg.additional_kwargs.get("reasoning_content")
+                            if reasoning:
+                                tracer.log_agui("THINKING_START", f"reasoning len={len(reasoning)}")
+                                yield encoder.encode(ThinkingStartEvent(title="Reasoning"))
+                                yield encoder.encode(ThinkingTextMessageStartEvent())
+                                # Stream reasoning in chunks
+                                chunk_size = 50
+                                for i in range(0, len(reasoning), chunk_size):
+                                    chunk = reasoning[i : i + chunk_size]
+                                    yield encoder.encode(
+                                        ThinkingTextMessageContentEvent(delta=chunk)
+                                    )
+                                    await asyncio.sleep(0.01)
+                                yield encoder.encode(ThinkingTextMessageEndEvent())
+                                yield encoder.encode(ThinkingEndEvent())
+                                tracer.log_agui("THINKING_END")
+
                             # Stream text content
                             if msg.content:
                                 tracer.log_agui("TEXT_MESSAGE_START", f"id={message_id[:8]}... role=assistant")
                                 yield encoder.encode(
                                     TextMessageStartEvent(message_id=message_id, role="assistant")
                                 )
-                                # Stream content in chunks
                                 content = str(msg.content)
                                 chunk_size = 5
                                 tracer.log_agui("TEXT_MESSAGE_CONTENT", f"chunks={len(content)//chunk_size + 1} total_len={len(content)}")
@@ -417,6 +510,16 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                 tracer.log_agui("TOOL_CALL_END", f"id={tc['id'][:8]}...")
                                 yield encoder.encode(ToolCallEndEvent(tool_call_id=tc["id"]))
 
+                                # Activity: tool execution starting
+                                tracer.log_agui("ACTIVITY_SNAPSHOT", f"tool={tc['name']} processing")
+                                yield encoder.encode(
+                                    ActivitySnapshotEvent(
+                                        message_id=activity_message_id,
+                                        activity_type="tool_execution",
+                                        content={"tool_name": tc["name"], "status": "processing"},
+                                    )
+                                )
+
                                 # Add to tool_logs (Tier 2 state tracking)
                                 tracer.log_agui("STATE_DELTA", "add /tool_logs/- status=processing")
                                 yield encoder.encode(
@@ -434,7 +537,6 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                         ]
                                     )
                                 )
-                                # Track tool_call_id -> index mapping for updates
                                 tool_call_id_to_idx[tc["id"]] = next_tool_log_idx
                                 next_tool_log_idx += 1
 
@@ -456,7 +558,20 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                     role="tool",
                                 )
                             )
-                            # Update tool_log status using tool_call_id mapping
+
+                            # Activity: tool completed
+                            tracer.log_agui("ACTIVITY_DELTA", f"tool={msg.tool_call_id[:8]}... completed")
+                            yield encoder.encode(
+                                ActivityDeltaEvent(
+                                    message_id=activity_message_id,
+                                    activity_type="tool_execution",
+                                    patch=[
+                                        {"op": "replace", "path": "/status", "value": "completed"},
+                                    ],
+                                )
+                            )
+
+                            # Update tool_log status
                             tool_idx = tool_call_id_to_idx.get(msg.tool_call_id)
                             if tool_idx is not None:
                                 tracer.log_agui("STATE_DELTA", f"replace /tool_logs/{tool_idx}/status=completed")
@@ -478,78 +593,25 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                 )
 
                 elif node_name == "__interrupt__":
+                    # Graph interrupted for frontend tool — just log it.
+                    # RUN_FINISHED will be emitted below (standard AG-UI flow).
                     tracer.log_event("INTERRUPT", "graph paused - frontend tool needed")
-                    # Graph was interrupted - frontend tool needs execution
-                    interrupted = True
-                    # node_output is a list of Interrupt objects
-                    # Each Interrupt has a "value" attribute with our data
-                    raw_interrupt = node_output[0] if node_output else None
-                    if hasattr(raw_interrupt, "value"):
-                        interrupt_data = raw_interrupt.value
-                    elif isinstance(raw_interrupt, dict):
-                        interrupt_data = raw_interrupt.get("value", raw_interrupt)
-                    else:
-                        interrupt_data = raw_interrupt
-
-                    # Send custom event to signal frontend tool required
-                    tracer.log_agui("CUSTOM_EVENT", f"frontend_tool_required data={interrupt_data}")
-                    yield encoder.encode(
-                        CustomEvent(
-                            name="frontend_tool_required",
-                            value=interrupt_data,
-                        )
-                    )
-
-                    # Update tool_log to show awaiting frontend
-                    frontend_tool_call_id = interrupt_data.get("tool_call_id") if isinstance(interrupt_data, dict) else None
-                    frontend_tool_idx = tool_call_id_to_idx.get(frontend_tool_call_id) if frontend_tool_call_id else None
-                    if frontend_tool_idx is not None:
-                        tracer.log_agui("STATE_DELTA", f"replace /tool_logs/{frontend_tool_idx}/message=awaiting")
-                        yield encoder.encode(
-                            StateDeltaEvent(
-                                delta=[
-                                    {
-                                        "op": "replace",
-                                        "path": f"/tool_logs/{frontend_tool_idx}/message",
-                                        "value": "Awaiting frontend execution...",
-                                    },
-                                ]
-                            )
-                        )
-
-                    # Send paused event
-                    tracer.log_agui("CUSTOM_EVENT", "run_paused reason=awaiting_frontend_tool")
-                    yield encoder.encode(
-                        CustomEvent(name="run_paused", value={"reason": "awaiting_frontend_tool"})
-                    )
 
             tracer.log_agui("STEP_FINISHED", "langgraph_execution")
             yield encoder.encode(StepFinishedEvent(step_name="langgraph_execution"))
 
-            # Only send RUN_FINISHED if not interrupted
-            if not interrupted:
-                tracer.log_event("GRAPH_COMPLETE", f"thread={thread_id[:8]}...")
-                tracer.log_agui("RUN_FINISHED", f"thread={thread_id[:8]}...")
-                yield encoder.encode(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
-            else:
-                tracer.log_event("GRAPH_INTERRUPTED", f"thread={thread_id[:8]}... awaiting frontend")
-                # For interrupted runs, include thread_id for resume
-                tracer.log_agui("CUSTOM_EVENT", f"run_interrupted thread={thread_id[:8]}...")
-                yield encoder.encode(
-                    CustomEvent(
-                        name="run_interrupted",
-                        value={"thread_id": thread_id, "reason": "frontend_tool_required"},
-                    )
-                )
+            # Always emit RUN_FINISHED (AG-UI protocol standard)
+            tracer.log_agui("RUN_FINISHED", f"thread={thread_id[:8]}...")
+            yield encoder.encode(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
 
         except Exception as e:
             import traceback
 
             traceback.print_exc()
-            tracer.log_agui("CUSTOM_EVENT", f"error message={str(e)[:50]}")
-            yield encoder.encode(CustomEvent(name="error", value={"message": str(e)}))
-            tracer.log_agui("RUN_FINISHED", f"thread={thread_id[:8]}... (error)")
-            yield encoder.encode(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+            tracer.log_agui("STEP_FINISHED", "langgraph_execution (error)")
+            yield encoder.encode(StepFinishedEvent(step_name="langgraph_execution"))
+            tracer.log_agui("RUN_ERROR", f"message={str(e)[:50]}")
+            yield encoder.encode(RunErrorEvent(message=str(e)))
 
     return StreamingResponse(
         generate(),

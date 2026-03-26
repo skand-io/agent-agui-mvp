@@ -3,10 +3,10 @@
  * Tier 1: Message-based tracking (tool calls in messages array)
  * Tier 2: State-based tracking (UI-friendly tool_logs array)
  *
- * Supports LangGraph interrupt/resume for sequential tool calling:
- * - Frontend tools pause execution via interrupt()
- * - Client executes tool and sends resume request
- * - Graph continues from where it left off
+ * AG-UI protocol compliant:
+ * - Sends RunAgentInput format requests
+ * - Executes frontend tools on RUN_FINISHED (pending tool detection)
+ * - Resumes with ToolMessage in messages array
  */
 
 import { applyPatch } from 'fast-json-patch';
@@ -27,6 +27,13 @@ const FRONTEND_TOOLS: Record<string, (args: any) => string> = {
   },
 };
 
+// Pending tool call info for frontend execution
+interface PendingToolCall {
+  toolCallId: string;
+  toolName: string;
+  args: string; // JSON string of arguments
+}
+
 export function useChat() {
   // Message-based tracking (Tier 1) - standard AG-UI messages array
   const [messages, setMessages] = useState<Message[]>([]);
@@ -39,54 +46,161 @@ export function useChat() {
 
   const [isLoading, setIsLoading] = useState(false);
 
+  // Current event being processed (for live UI indicator)
+  const [currentEvent, setCurrentEvent] = useState<string | null>(null);
+
+  // Thinking content from reasoning model
+  const [thinkingContent, setThinkingContent] = useState<string | null>(null);
+
   // Refs for building messages during streaming
   const currentMessage = useRef<AssistantMessage | null>(null);
   const currentToolCall = useRef<Partial<ToolCall> | null>(null);
 
-  // Track thread_id for resume functionality
+  // Track thread_id and run_id for resume functionality
   const currentThreadId = useRef<string | null>(null);
+
+  // Track pending tool calls: added on TOOL_CALL_END, removed on TOOL_CALL_RESULT
+  const pendingToolCalls = useRef<Map<string, PendingToolCall>>(new Map());
 
   // Ref to hold the processStream function for use in handleEvent
   const processStreamRef = useRef<((response: Response) => Promise<void>) | null>(null);
+
+  /**
+   * Build RunAgentInput request body
+   */
+  function buildRunAgentInput(
+    threadId: string,
+    runId: string,
+    msgs: Array<{ id: string; role: string; content: string; tool_call_id?: string }>
+  ) {
+    return {
+      thread_id: threadId,
+      run_id: runId,
+      messages: msgs,
+      tools: [],
+      context: [],
+    };
+  }
 
   /**
    * Handle a single AG-UI event
    */
   const handleEvent = useCallback(async (event: any) => {
     console.log('🔍 handleEvent:', event);
+
+    // Update current event for live UI indicator
+    setCurrentEvent(event.type);
+
     switch (event.type) {
       // === LIFECYCLE ===
       case EventType.RUN_STARTED:
-        console.log('🚀 RUN_STARTED:', event.runId || event.run_id);
-        // Update thread_id if provided (for resume support)
-        if (event.threadId || event.thread_id) {
-          currentThreadId.current = event.threadId || event.thread_id;
+        console.log('🚀 RUN_STARTED:', event.runId);
+        if (event.threadId) {
+          currentThreadId.current = event.threadId;
         }
         setIsLoading(true);
         break;
 
-      case EventType.RUN_FINISHED:
+      case EventType.RUN_FINISHED: {
         console.log('🏁 RUN_FINISHED');
-        console.log('🏁 currentMessage.current:', currentMessage.current);
-        setIsLoading(false);
+
         // Finalize any pending message
         if (currentMessage.current) {
-          setMessages((prev) => [...prev, currentMessage.current!]);
+          const message = currentMessage.current;
+          setMessages((prev) => {
+            const filtered = prev.filter((m) => m.id !== message.id);
+            return [...filtered, message];
+          });
           currentMessage.current = null;
         }
+
+        // Check for pending frontend tool calls
+        const pending = Array.from(pendingToolCalls.current.values()).filter(
+          (tc) => tc.toolName in FRONTEND_TOOLS
+        );
+
+        if (pending.length > 0) {
+          // Execute the first pending frontend tool
+          const toolCall = pending[0];
+          console.log('🔧 Executing pending frontend tool:', toolCall.toolName);
+
+          const handler = FRONTEND_TOOLS[toolCall.toolName];
+          if (handler) {
+            try {
+              const args = JSON.parse(toolCall.args);
+              const result = handler(args);
+              console.log('✅ Frontend tool executed:', { tool: toolCall.toolName, result });
+
+              // Remove from pending
+              pendingToolCalls.current.delete(toolCall.toolCallId);
+
+              // Resume with ToolMessage in RunAgentInput format
+              const threadId = currentThreadId.current;
+              if (threadId && processStreamRef.current) {
+                const resumeRunId = crypto.randomUUID();
+                const response = await fetch('http://localhost:8000/chat', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(
+                    buildRunAgentInput(threadId, resumeRunId, [
+                      {
+                        id: crypto.randomUUID(),
+                        role: 'tool',
+                        tool_call_id: toolCall.toolCallId,
+                        content: result,
+                      },
+                    ])
+                  ),
+                });
+
+                await processStreamRef.current(response);
+              }
+            } catch (error) {
+              console.error('Failed to execute frontend tool:', error);
+              // Resume with error
+              const threadId = currentThreadId.current;
+              if (threadId && processStreamRef.current) {
+                const resumeRunId = crypto.randomUUID();
+                const response = await fetch('http://localhost:8000/chat', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(
+                    buildRunAgentInput(threadId, resumeRunId, [
+                      {
+                        id: crypto.randomUUID(),
+                        role: 'tool',
+                        tool_call_id: toolCall.toolCallId,
+                        content: `Error: ${error}`,
+                      },
+                    ])
+                  ),
+                });
+                await processStreamRef.current(response);
+              }
+            }
+          }
+        } else {
+          // No pending frontend tools — run is truly finished
+          setIsLoading(false);
+          setCurrentEvent(null);
+          setThinkingContent(null);
+        }
         break;
+      }
 
       case EventType.RUN_ERROR:
         console.log('❌ RUN_ERROR:', event.message);
         setIsLoading(false);
+        setCurrentEvent(null);
+        setThinkingContent(null);
         break;
 
       case EventType.STEP_STARTED:
-        console.log('▶️ STEP_STARTED:', event.stepName || event.step_name);
+        console.log('▶️ STEP_STARTED:', event.stepName);
         break;
 
       case EventType.STEP_FINISHED:
-        console.log('⏸️ STEP_FINISHED:', event.stepName || event.step_name);
+        console.log('⏸️ STEP_FINISHED:', event.stepName);
         break;
 
       // === STATE TRACKING (Tier 2 - UI progress) ===
@@ -110,9 +224,9 @@ export function useChat() {
         break;
 
       case EventType.TEXT_MESSAGE_START:
-        console.log('💬 TEXT_MESSAGE_START:', event.messageId || event.message_id);
+        console.log('💬 TEXT_MESSAGE_START:', event.messageId);
         currentMessage.current = {
-          id: event.messageId || event.message_id,
+          id: event.messageId,
           role: 'assistant',
           content: '',
           toolCalls: [],
@@ -122,12 +236,8 @@ export function useChat() {
       case EventType.TEXT_MESSAGE_CONTENT:
         console.log('💬 TEXT_MESSAGE_CONTENT:', event.delta);
         if (currentMessage.current) {
-          // update the current message content
           currentMessage.current.content = (currentMessage.current.content || '') + event.delta;
-
-          // Capture ref value to avoid null access in async callback
           const message = currentMessage.current;
-          // Update message in real-time
           setMessages((prev) => {
             const filtered = prev.filter((m) => m.id !== message.id);
             return [...filtered, message];
@@ -138,9 +248,7 @@ export function useChat() {
       case EventType.TEXT_MESSAGE_END:
         console.log('💬 TEXT_MESSAGE_END');
         if (currentMessage.current) {
-          // Capture ref value to avoid null access in async callback
           const message = currentMessage.current;
-          console.log('💬 TEXT_MESSAGE_END currentMessage.current:', message);
           setMessages((prev) => {
             const filtered = prev.filter((m) => m.id !== message.id);
             return [...filtered, message];
@@ -150,12 +258,22 @@ export function useChat() {
 
       // === TOOL CALL TRACKING (Tier 1 - tool calls in messages) ===
       case EventType.TOOL_CALL_START:
-        console.log('🔧 TOOL_CALL_START:', event.toolCallName || event.tool_call_name);
+        console.log('🔧 TOOL_CALL_START:', event.toolCallName);
+        // Create an assistant message if one doesn't exist yet
+        // (happens when LLM returns tool calls without text content)
+        if (!currentMessage.current) {
+          currentMessage.current = {
+            id: event.parentMessageId || crypto.randomUUID(),
+            role: 'assistant',
+            content: '',
+            toolCalls: [],
+          };
+        }
         currentToolCall.current = {
-          id: event.toolCallId || event.tool_call_id,
+          id: event.toolCallId,
           type: 'function',
           function: {
-            name: event.toolCallName || event.tool_call_name,
+            name: event.toolCallName,
             arguments: '',
           },
         };
@@ -170,25 +288,22 @@ export function useChat() {
 
       case EventType.TOOL_CALL_END:
         console.log('🔧 TOOL_CALL_END');
-
-        console.log('🔧 currentToolCall.current:', currentToolCall.current);
-        console.log('🔧 currentMessage.current:', currentMessage.current);
-
         if (currentToolCall.current && currentMessage.current) {
           currentMessage.current.toolCalls = currentMessage.current.toolCalls || [];
           currentMessage.current.toolCalls.push(currentToolCall.current as ToolCall);
 
-          // Capture ref value to avoid null access in async callback
           const message = currentMessage.current;
-
-          // Update message with tool call
           setMessages((prev) => {
             const filtered = prev.filter((m) => m.id !== message.id);
             return [...filtered, message];
           });
 
-          // NOTE: We no longer execute frontend tools here for the LangGraph backend.
-          // Frontend tools are executed via the frontend_tool_required custom event.
+          // Track as pending (will be removed on TOOL_CALL_RESULT)
+          pendingToolCalls.current.set(currentToolCall.current.id!, {
+            toolCallId: currentToolCall.current.id!,
+            toolName: currentToolCall.current.function!.name,
+            args: currentToolCall.current.function!.arguments,
+          });
 
           currentToolCall.current = null;
         }
@@ -196,21 +311,21 @@ export function useChat() {
 
       case EventType.TOOL_CALL_RESULT:
         console.log('🔧 TOOL_CALL_RESULT:', event.content);
-        // Add tool result message (deduplicate by toolCallId)
+        // Remove from pending (backend handled this tool)
+        pendingToolCalls.current.delete(event.toolCallId);
+
         setMessages((prev) => {
-          const toolCallId = event.toolCallId || event.tool_call_id;
-          // Skip if we already have a result for this tool call
+          const toolCallId = event.toolCallId;
           const existingResult = prev.find(
             (m) => m.role === 'tool' && (m as any).toolCallId === toolCallId
           );
           if (existingResult) {
-            console.log('🔧 Skipping duplicate TOOL_CALL_RESULT:', toolCallId);
             return prev;
           }
           return [
             ...prev,
             {
-              id: event.messageId || event.message_id,
+              id: event.messageId,
               role: 'tool',
               toolCallId,
               content: event.content,
@@ -237,6 +352,7 @@ export function useChat() {
       // === THINKING ===
       case EventType.THINKING_START:
         console.log('🧠 THINKING_START:', event.title);
+        setThinkingContent('');
         break;
 
       case EventType.THINKING_END:
@@ -249,6 +365,7 @@ export function useChat() {
 
       case EventType.THINKING_TEXT_MESSAGE_CONTENT:
         console.log('🧠 THINKING_TEXT_MESSAGE_CONTENT:', event.delta);
+        setThinkingContent((prev) => (prev || '') + event.delta);
         break;
 
       case EventType.THINKING_TEXT_MESSAGE_END:
@@ -258,66 +375,6 @@ export function useChat() {
       // === SPECIAL ===
       case EventType.CUSTOM:
         console.log('🎯 CUSTOM:', event.name, event.value);
-
-        // Handle frontend tool required (LangGraph interrupt)
-        if (event.name === 'frontend_tool_required') {
-          const { tool_call_id, tool_name, args } = event.value;
-          console.log('🔄 Frontend tool required:', { tool_call_id, tool_name, args });
-
-          // Execute the frontend tool
-          const handler = FRONTEND_TOOLS[tool_name];
-          if (handler) {
-            try {
-              const result = handler(args);
-              console.log('✅ Frontend tool executed:', { tool_name, result });
-
-              // Resume the graph with the result
-              const threadId = currentThreadId.current;
-              if (threadId && processStreamRef.current) {
-                console.log('🔄 Resuming graph with result:', { threadId, result });
-
-                const response = await fetch('http://localhost:8000/chat', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    thread_id: threadId,
-                    resume_value: result,
-                    message: '', // Empty message for resume
-                  }),
-                });
-
-                // Process the resumed stream
-                await processStreamRef.current(response);
-              } else {
-                console.error('No thread_id or processStream available for resume');
-              }
-            } catch (error) {
-              console.error('Failed to execute frontend tool:', error);
-              // Resume with error message
-              const threadId = currentThreadId.current;
-              if (threadId && processStreamRef.current) {
-                const response = await fetch('http://localhost:8000/chat', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    thread_id: threadId,
-                    resume_value: `Error: ${error}`,
-                    message: '',
-                  }),
-                });
-                await processStreamRef.current(response);
-              }
-            }
-          } else {
-            console.error('Unknown frontend tool:', tool_name);
-          }
-        } else if (event.name === 'run_interrupted') {
-          // Run was interrupted for frontend tool - keep loading state
-          console.log('⏸️ Run interrupted, awaiting frontend tool execution');
-          // Don't set isLoading to false here - the resume will complete
-        } else if (event.name === 'run_paused') {
-          console.log('⏸️ Run paused:', event.value);
-        }
         break;
 
       default:
@@ -384,19 +441,22 @@ export function useChat() {
       // Reset state
       currentMessage.current = null;
       currentToolCall.current = null;
+      pendingToolCalls.current.clear();
 
-      // Generate a thread_id for this conversation
+      // Generate IDs for this request
       const threadId = crypto.randomUUID();
+      const runId = crypto.randomUUID();
       currentThreadId.current = threadId;
 
       try {
         const response = await fetch('http://localhost:8000/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: content,
-            thread_id: threadId,
-          }),
+          body: JSON.stringify(
+            buildRunAgentInput(threadId, runId, [
+              { id: userMessage.id, role: 'user', content },
+            ])
+          ),
         });
 
         await processStream(response);
@@ -408,5 +468,5 @@ export function useChat() {
     [processStream]
   );
 
-  return { messages, isLoading, sendMessage, agentState, activity };
+  return { messages, isLoading, sendMessage, agentState, activity, currentEvent, thinkingContent };
 }

@@ -1,14 +1,49 @@
 /**
  * AG-UI Minimal Example - Main App Component
  * Displays two-tier tool tracking: messages (Tier 1) and tool logs (Tier 2)
+ * Live event stream indicator and thinking content display
  */
 
 import { useState } from 'react';
 import './App.css';
 import { useChat } from './useChat';
 
+// Human-readable labels for AG-UI event types
+const EVENT_LABELS: Record<string, string> = {
+  RUN_STARTED: 'Starting run',
+  RUN_FINISHED: 'Run complete',
+  RUN_ERROR: 'Error',
+  STEP_STARTED: 'Step started',
+  STEP_FINISHED: 'Step finished',
+  THINKING_START: 'Thinking...',
+  THINKING_END: 'Done thinking',
+  THINKING_TEXT_MESSAGE_START: 'Reasoning...',
+  THINKING_TEXT_MESSAGE_CONTENT: 'Reasoning...',
+  THINKING_TEXT_MESSAGE_END: 'Done reasoning',
+  TEXT_MESSAGE_START: 'Writing response...',
+  TEXT_MESSAGE_CONTENT: 'Streaming text...',
+  TEXT_MESSAGE_END: 'Response complete',
+  TOOL_CALL_START: 'Calling tool...',
+  TOOL_CALL_ARGS: 'Sending arguments...',
+  TOOL_CALL_END: 'Tool call sent',
+  TOOL_CALL_RESULT: 'Tool result received',
+  STATE_SNAPSHOT: 'State snapshot',
+  STATE_DELTA: 'State update',
+  MESSAGES_SNAPSHOT: 'Messages snapshot',
+  ACTIVITY_SNAPSHOT: 'Activity update',
+  ACTIVITY_DELTA: 'Activity update',
+  CUSTOM: 'Custom event',
+};
+
 export default function App() {
-  const { messages, isLoading, sendMessage, agentState, activity } = useChat();
+  const {
+    messages,
+    isLoading,
+    sendMessage,
+    agentState,
+    currentEvent,
+    thinkingContent,
+  } = useChat();
   const [input, setInput] = useState('');
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -22,61 +57,59 @@ export default function App() {
   return (
     <div className="app">
       <h1>AG-UI Minimal Example</h1>
-      <p className="subtitle">Demonstrating all 21 AG-UI events + two-tier state sync</p>
+      <p className="subtitle">Full AG-UI protocol with live event stream</p>
 
-      {/* Activity Indicator */}
-      {activity && (
-        <div className="activity" data-testid="activity">
-          <strong>Status:</strong> {activity.status}
-          {activity.progress !== undefined && ` (${activity.progress}%)`}
+      {/* Live Event Indicator */}
+      {currentEvent && (
+        <div className="event-indicator" data-testid="event-indicator">
+          <span className="event-dot" />
+          <span className="event-type">{currentEvent}</span>
+          <span className="event-label">
+            {EVENT_LABELS[currentEvent] || currentEvent}
+          </span>
+        </div>
+      )}
+
+      {/* Thinking Content (from reasoning model) */}
+      {thinkingContent && (
+        <div className="thinking" data-testid="thinking">
+          <div className="thinking-header">Reasoning</div>
+          <div className="thinking-content">{thinkingContent}</div>
         </div>
       )}
 
       {/* Messages (Tier 1 - message-based tracking) */}
       <div className="messages" data-testid="messages">
-        {messages.filter(msg => msg != null).map((msg, i) => (
-          <div
-            key={msg.id || i}
-            className={`message message-${msg.role}`}
-            data-testid={`message-${msg.role}`}
-          >
-            <div className="message-role">{msg.role}:</div>
-            <div className="message-content">
-              {'content' in msg && typeof msg.content === 'string' && msg.content}
-
-              {/* Display tool calls from assistant messages
-              {msg.role === 'assistant' && 'toolCalls' in msg && msg.toolCalls && msg.toolCalls.length > 0 && (
-                <div className="tool-calls">
-                  {msg.toolCalls.map((tc) => (
-                    <div
-                      key={tc.id}
-                      className="tool-call"
-                      data-testid={`tool-call-${tc.function.name}`}
-                    >
-                      📞 {tc.function.name}({tc.function.arguments})
-                    </div>
-                  ))}
-                </div>
-              )} */}
+        {messages
+          .filter((msg) => msg != null)
+          .map((msg, i) => (
+            <div
+              key={msg.id || i}
+              className={`message message-${msg.role}`}
+              data-testid={`message-${msg.role}`}
+            >
+              <div className="message-role">{msg.role}:</div>
+              <div className="message-content">
+                {'content' in msg && typeof msg.content === 'string' && msg.content}
+              </div>
             </div>
-          </div>
-        ))}
-        {isLoading && <div className="loading">Thinking...</div>}
+          ))}
+        {isLoading && !currentEvent && <div className="loading">Thinking...</div>}
       </div>
 
       {/* Tool Logs (Tier 2 - state-based tracking for UI progress) */}
       {agentState.tool_logs.length > 0 && (
         <div className="tool-logs" data-testid="tool-logs">
-          <h3>Tool Progress (State-Based Tracking)</h3>
+          <h3>Tool Progress</h3>
           {agentState.tool_logs.map((log) => (
             <div
               key={log.id}
               className={`tool-log tool-log-${log.status}`}
               data-testid={`tool-log-${log.id}`}
             >
-              {log.status === 'processing' && '⏳'}
-              {log.status === 'completed' && '✅'}
-              {log.status === 'error' && '❌'}
+              {log.status === 'processing' && '\u23F3'}
+              {log.status === 'completed' && '\u2705'}
+              {log.status === 'error' && '\u274C'}
               {' '}
               {log.message}
             </div>
@@ -104,10 +137,6 @@ export default function App() {
           Send
         </button>
       </form>
-
-      <div className="instructions">
-        <strong>Instructions:</strong> Open browser console to see all 21 AG-UI events logged with emoji
-      </div>
     </div>
   );
 }
